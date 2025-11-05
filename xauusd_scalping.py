@@ -39,6 +39,9 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 
+MIN_REQUIRED_CANDLES = 3
+
+
 @dataclass
 class StrategyConfig:
     symbol: str = "XAUUSD"
@@ -114,6 +117,11 @@ def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df.set_index("time", inplace=True)
+    df.sort_index(inplace=True)
+    for column in ("open", "high", "low", "close"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["tick_volume"] = pd.to_numeric(df["tick_volume"], errors="coerce").fillna(0).astype(int)
+    df.dropna(subset=("open", "high", "low", "close"), inplace=True)
     return df
 
 
@@ -131,19 +139,26 @@ def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame
     prices["ema_slow"] = prices["close"].ewm(span=config.ema_slow_period, adjust=False).mean()
 
     delta = prices["close"].diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
+    loss = loss.replace(0, np.nan)
+    rs = gain / loss
     prices["rsi"] = 100 - (100 / (1 + rs))
+    prices["rsi"] = prices["rsi"].clip(lower=0, upper=100)
 
-    tr = np.maximum(
-        prices["high"] - prices["low"],
-        np.maximum(
-            prices["high"] - prices["close"].shift(1),
-            prices["close"].shift(1) - prices["low"],
-        ),
+    tr_components = np.column_stack(
+        (
+            prices["high"] - prices["low"],
+            (prices["high"] - prices["close"].shift(1)).abs(),
+            (prices["close"].shift(1) - prices["low"]).abs(),
+        )
     )
-    prices["atr"] = tr.rolling(window=config.atr_period, min_periods=1).mean()
+    tr = np.nanmax(tr_components, axis=1)
+    prices["atr"] = pd.Series(tr, index=prices.index).ewm(
+        alpha=1 / config.atr_period,
+        adjust=False,
+    ).mean()
+    prices.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     return prices
 
@@ -166,15 +181,45 @@ class TradeSignal:
 def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[TradeSignal]:
     """Generate a trade signal based on EMA crossover + RSI filter + volatility."""
 
-    latest = prices.iloc[-1]
-    previous = prices.iloc[-2]
+    required_columns = {"ema_fast", "ema_slow", "rsi", "atr"}
+    missing_columns = required_columns.difference(prices.columns)
+    if missing_columns:
+        logging.debug("Skipping signal generation; missing columns: %s", sorted(missing_columns))
+        return None
+
+    filtered = prices.dropna(subset=required_columns)
+    if len(filtered) < MIN_REQUIRED_CANDLES:
+        logging.debug(
+            "Skipping signal generation; requires >=%d valid candles, got %d",
+            MIN_REQUIRED_CANDLES,
+            len(filtered),
+        )
+        return None
+
+    latest = filtered.iloc[-1]
+    previous = filtered.iloc[-2]
+
+    try:
+        latest_bid = prices.at[latest.name, "bid"]
+        latest_ask = prices.at[latest.name, "ask"]
+    except KeyError:
+        logging.debug("Bid/ask data missing for timestamp %s; skipping signal", latest.name)
+        return None
+
+    if latest_bid is None or latest_ask is None or np.isnan(latest_bid) or np.isnan(latest_ask):
+        logging.debug("Bid/ask data invalid for timestamp %s; skipping signal", latest.name)
+        return None
 
     symbol_info = mt5.symbol_info(config.symbol)
     if symbol_info is None:
         logging.warning("Symbol info for %s unavailable; cannot compute signal", config.symbol)
         return None
 
-    spread_points = (latest["ask"] - latest["bid"]) / symbol_info.point
+    if not symbol_info.point:
+        logging.warning("Symbol point value for %s is zero; cannot compute spread", config.symbol)
+        return None
+
+    spread_points = (latest_ask - latest_bid) / symbol_info.point
     if spread_points > config.max_spread_points:
         logging.info("Spread %.1f exceeds threshold %.1f, skipping signal.", spread_points, config.max_spread_points)
         return None
@@ -184,14 +229,23 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
     atr_points = latest["atr"]
+    if np.isnan(atr_points) or atr_points <= 0:
+        logging.debug("ATR invalid (value=%s); skipping signal", atr_points)
+        return None
+
+    timestamp = latest.name.to_pydatetime()
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
 
     if bullish_cross and latest["rsi"] < config.rsi_upper:
-        entry = latest["ask"]
+        entry = latest_ask
         stop_loss = entry - 1.5 * atr_points
         take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
         return TradeSignal(
             direction="buy",
-            timestamp=latest.name.to_pydatetime(),
+            timestamp=timestamp,
             entry=entry,
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -199,12 +253,12 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
         )
 
     if bearish_cross and latest["rsi"] > config.rsi_lower:
-        entry = latest["bid"]
+        entry = latest_bid
         stop_loss = entry + 1.5 * atr_points
         take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
         return TradeSignal(
             direction="sell",
-            timestamp=latest.name.to_pydatetime(),
+            timestamp=timestamp,
             entry=entry,
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -218,9 +272,14 @@ def format_signal(signal: TradeSignal, config: StrategyConfig) -> str:
     """İnsan tarafından okunabilir sinyal çıktısı üret."""
 
     direction = "AL" if signal.direction == "buy" else "SAT"
+    timestamp = signal.timestamp
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
     lines = [
         f"Sinyal: {direction}",
-        f"Zaman: {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Zaman: {timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"Giriş fiyatı: {signal.entry:.2f}",
         f"Stop-loss:   {signal.stop_loss:.2f}",
         f"Take-profit: {signal.take_profit:.2f}",
@@ -284,12 +343,14 @@ def main() -> None:
         logging.info("MT5 terminal initialised")
 
         raw = fetch_rates(config)
-        symbol_info = mt5.symbol_info_tick(config.symbol)
-        if symbol_info is None:
+        logging.debug("Fetched %d candles for %s", len(raw), config.symbol)
+
+        symbol_tick = mt5.symbol_info_tick(config.symbol)
+        if symbol_tick is None:
             raise RuntimeError(f"Symbol tick info for {config.symbol} unavailable")
 
-        raw["bid"] = symbol_info.bid
-        raw["ask"] = symbol_info.ask
+        raw["bid"] = symbol_tick.bid
+        raw["ask"] = symbol_tick.ask
 
         enriched = compute_indicators(raw, config)
         signal = generate_signal(enriched, config)
@@ -298,6 +359,10 @@ def main() -> None:
             logging.info("Sinyal bulundu:\n%s", format_signal(signal, config))
         else:
             logging.info("No valid signal at %s", datetime.now(timezone.utc))
+
+    except Exception:
+        logging.exception("Unexpected error while running strategy")
+        raise
 
     finally:
         shutdown_mt5()
