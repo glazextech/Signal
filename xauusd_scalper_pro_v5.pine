@@ -1,0 +1,151 @@
+//@version=5
+// XAUUSD Scalper Pro
+// This indicator is designed for discretionary scalping on Gold (XAUUSD) timeframes
+// and comes with configurable trend, momentum, volatility and risk management filters.
+// Past performance is not indicative of future results. Use on a demo account first.
+
+indicator("XAUUSD Scalper Pro v5", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ────────────────────────── Inputs ──────────────────────────
+emaFastLen      = input.int(9,  "Fast EMA Length",  minval=1)
+emaSlowLen      = input.int(34, "Slow EMA Length",  minval=1)
+
+higherTf        = input.timeframe("15", "Higher Timeframe for Trend Filter")
+htfEmaLen       = input.int(55, "Higher TF EMA Length", minval=1)
+
+supertrendAtr   = input.int(10, "Supertrend ATR Length", minval=1)
+supertrendMult  = input.float(2.5, "Supertrend Factor", step=0.1)
+
+rsiLen          = input.int(7,  "RSI Length", minval=1)
+rsiLongThresh   = input.float(55.0, "RSI Threshold - Long", step=0.1)
+rsiShortThresh  = input.float(45.0, "RSI Threshold - Short", step=0.1)
+
+stochLen        = input.int(14, "Stochastic Length", minval=1)
+stochSmoothK    = input.int(3,  "Stochastic %K Smoothing", minval=1)
+stochSmoothD    = input.int(3,  "Stochastic %D Smoothing", minval=1)
+stochBand       = input.float(5.0, "Stochastic Buffer", step=0.1)
+
+atrLen          = input.int(14, "ATR Length", minval=1)
+atrSmooth       = input.int(21, "ATR Smoothing", minval=1)
+atrMultStop     = input.float(1.2, "ATR Multiple for Stop", step=0.1)
+rewardRisk      = input.float(1.6, "Reward to Risk Ratio", step=0.1)
+
+useVolFilter    = input.bool(true, "Use Volatility Filter")
+useSession      = input.bool(true, "Use Session Filter")
+sessionInput    = input.session("0100-2300", "Active Trading Session (chart timezone)")
+
+showStops       = input.bool(true, "Plot Active Stops/Targets")
+showLabels      = input.bool(true, "Show Entry/Exit Labels")
+
+// ────────────────────────── Calculations ──────────────────────────
+emaFast         = ta.ema(close, emaFastLen)
+emaSlow         = ta.ema(close, emaSlowLen)
+
+htfEma          = request.security(syminfo.tickerid, higherTf, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+[superTrend, superTrendDir] = ta.supertrend(supertrendMult, supertrendAtr)
+
+rsiValue        = ta.rsi(close, rsiLen)
+rawStoch        = ta.stoch(high, low, close, stochLen)
+stochK          = ta.sma(rawStoch, stochSmoothK)
+stochD          = ta.sma(stochK, stochSmoothD)
+
+atrValue        = ta.atr(atrLen)
+atrAverage      = ta.sma(atrValue, atrSmooth)
+
+volatilityOk    = not useVolFilter or atrValue > atrAverage
+sessionOk       = not useSession or not na(time(timeframe.period, sessionInput))
+
+trendUp         = close > emaSlow and close > htfEma and superTrendDir == 1
+trendDown       = close < emaSlow and close < htfEma and superTrendDir == -1
+
+momentumLong    = rsiValue > rsiLongThresh and stochK > stochD + stochBand
+momentumShort   = rsiValue < rsiShortThresh and stochK < stochD - stochBand
+
+// Entry conditions
+longSignal      = ta.crossover(emaFast, emaSlow) and trendUp and momentumLong and volatilityOk and sessionOk
+shortSignal     = ta.crossunder(emaFast, emaSlow) and trendDown and momentumShort and volatilityOk and sessionOk
+
+// ────────────────────────── Trade State ──────────────────────────
+var bool   inLong      = false
+var bool   inShort     = false
+var float  longStop    = na
+var float  longTarget  = na
+var float  shortStop   = na
+var float  shortTarget = na
+
+if longSignal
+    inLong      := true
+    inShort     := false
+    longStop    := close - atrValue * atrMultStop
+    longTarget  := close + atrValue * atrMultStop * rewardRisk
+    shortStop   := na
+    shortTarget := na
+
+if shortSignal
+    inLong      := false
+    inShort     := true
+    shortStop   := close + atrValue * atrMultStop
+    shortTarget := close - atrValue * atrMultStop * rewardRisk
+    longStop    := na
+    longTarget  := na
+
+longStopHit    = inLong  and close <= longStop
+longTargetHit  = inLong  and close >= longTarget
+shortStopHit   = inShort and close >= shortStop
+shortTargetHit = inShort and close <= shortTarget
+
+exitLongSignal = longStopHit or longTargetHit or (inLong  and ta.crossunder(emaFast, emaSlow))
+exitShortSignal= shortStopHit or shortTargetHit or (inShort and ta.crossover(emaFast, emaSlow))
+
+if exitLongSignal
+    inLong     := false
+    longStop   := na
+    longTarget := na
+
+if exitShortSignal
+    inShort     := false
+    shortStop   := na
+    shortTarget := na
+
+// ────────────────────────── Plots ──────────────────────────
+plot(emaFast, title="EMA Fast", color=color.new(color.teal, 0))
+plot(emaSlow, title="EMA Slow", color=color.new(color.orange, 0))
+
+plot(superTrend, title="Supertrend", color=superTrendDir == 1 ? color.new(color.lime, 0) : color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+
+bgcolor(trendUp ? color.new(color.green, 92) : trendDown ? color.new(color.red, 92) : na)
+
+plot(showStops ? (inLong  ? longStop   : na) : na, title="Long Stop",   color=color.new(color.red,  20), style=plot.style_linebr, linewidth=2)
+plot(showStops ? (inLong  ? longTarget : na) : na, title="Long Target", color=color.new(color.green,20), style=plot.style_linebr, linewidth=2)
+plot(showStops ? (inShort ? shortStop  : na) : na, title="Short Stop",  color=color.new(color.red,  20), style=plot.style_linebr, linewidth=2)
+plot(showStops ? (inShort ? shortTarget: na) : na, title="Short Target",color=color.new(color.green,20), style=plot.style_linebr, linewidth=2)
+
+if showLabels and longSignal
+    label.new(bar_index, low, text="Long", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
+if showLabels and shortSignal
+    label.new(bar_index, high, text="Short", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+if showLabels and exitLongSignal
+    label.new(bar_index, close, text="Exit L", style=label.style_label_down, color=color.new(color.yellow, 10), textcolor=color.black)
+if showLabels and exitShortSignal
+    label.new(bar_index, close, text="Exit S", style=label.style_label_up, color=color.new(color.yellow, 10), textcolor=color.black)
+
+// ────────────────────────── Alerts ──────────────────────────
+alertcondition(longSignal,      title="XAUUSD Long Entry",   message="Long entry signal on {{ticker}} at {{close}}")
+alertcondition(shortSignal,     title="XAUUSD Short Entry",  message="Short entry signal on {{ticker}} at {{close}}")
+alertcondition(exitLongSignal,  title="XAUUSD Long Exit",    message="Exit long on {{ticker}} at {{close}}")
+alertcondition(exitShortSignal, title="XAUUSD Short Exit",   message="Exit short on {{ticker}} at {{close}}")
+
+// ────────────────────────── Diagnostics ──────────────────────────
+var table infoTable = table.new(position.top_right, 1, 4)
+if barstate.islastconfirmedhistory
+    table.cell(infoTable, 0, 0, text="Trend: " + (trendUp ? "Bullish" : trendDown ? "Bearish" : "Neutral"), text_color=color.white, bgcolor=trendUp ? color.new(color.green, 65) : trendDown ? color.new(color.red, 65) : color.new(color.orange, 65))
+    table.cell(infoTable, 0, 1, text="Volatility: " + (volatilityOk ? "Eligible" : "Muted"), text_color=color.white, bgcolor=volatilityOk ? color.new(color.green, 80) : color.new(color.red, 80))
+    table.cell(infoTable, 0, 2, text="RSI: " + str.tostring(rsiValue, format.mintick), text_color=color.white, bgcolor=color.new(color.blue, 80))
+    table.cell(infoTable, 0, 3, text="ATR: " + str.tostring(atrValue, format.mintick), text_color=color.white, bgcolor=color.new(color.purple, 80))
+
+// ────────────────────────── Notes ──────────────────────────
+// • Recommended chart timeframe: 1m to 5m on XAUUSD.
+// • Tune RSI/Stochastic thresholds depending on market regime.
+// • Combine with order-flow or volume analysis for improved decision making.
+// • Always validate on historical and forward testing before committing capital.
