@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -98,18 +99,89 @@ def shutdown_mt5() -> None:
     mt5.shutdown()
 
 
+def ensure_symbol_selected(symbol: str) -> str:
+    """Ensure symbol exists in MarketWatch and return the resolved name."""
+
+    info = mt5.symbol_info(symbol)
+    if info is not None:
+        if not info.visible:
+            if not mt5.symbol_select(symbol, True):
+                raise RuntimeError(
+                    f"Sembol {symbol} MarketWatch'ta aktifleştirilemedi: {mt5.last_error()}"
+                )
+        return symbol
+
+    candidates = mt5.symbols_get()
+    if not candidates:
+        raise RuntimeError(
+            "MT5 sembol listesi alınamadı. Terminal bağlantısını ve login durumunu kontrol edin."
+        )
+
+    uppercase_symbol = symbol.upper()
+    resolved_name = None
+    for candidate in candidates:
+        name = candidate.name
+        if name.upper() == uppercase_symbol:
+            resolved_name = name
+            break
+        if uppercase_symbol in name.upper():
+            resolved_name = name
+            # tam eşleşme aramaya devam et
+
+    if resolved_name is None:
+        raise RuntimeError(
+            f"Sembol {symbol} MT5'te bulunamadı. Broker sembol adını doğrulayın (ör. XAUUSDm, XAUUSD. vb.)."
+        )
+
+    if not mt5.symbol_select(resolved_name, True):
+        raise RuntimeError(
+            f"Sembol {resolved_name} MarketWatch'ta aktifleştirilemedi: {mt5.last_error()}"
+        )
+
+    logging.info("Sembol %s yerine %s kullanılacak.", symbol, resolved_name)
+    return resolved_name
+
+
 def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
     """Fetch recent price candles for the configured symbol/timeframe."""
 
-    rates = mt5.copy_rates_from_pos(
-        config.symbol,
-        config.timeframe,
-        0,
-        config.lookback,
-    )
+    resolved_symbol = ensure_symbol_selected(config.symbol)
+    if resolved_symbol != config.symbol:
+        logging.info("Config sembolü %s -> %s olarak güncellendi", config.symbol, resolved_symbol)
+        config.symbol = resolved_symbol
 
-    if rates is None or len(rates) == 0:
-        raise RuntimeError(f"Failed to fetch rates for {config.symbol}: {mt5.last_error()}")
+    rates = None
+    last_error = None
+    for attempt in range(1, 4):
+        rates = mt5.copy_rates_from_pos(
+            config.symbol,
+            config.timeframe,
+            0,
+            config.lookback,
+        )
+
+        if rates is not None and len(rates) > 0:
+            break
+
+        last_error = mt5.last_error()
+        logging.warning(
+            "copy_rates_from_pos başarısız (attempt=%s, symbol=%s, timeframe=%s, error=%s)",
+            attempt,
+            config.symbol,
+            config.timeframe,
+            last_error,
+        )
+
+        # sembol MarketWatch listesinden düşmüş olabilir. Tekrar seçip kısa süre bekle.
+        mt5.symbol_select(config.symbol, True)
+        time.sleep(0.4)
+    else:
+        error_text = (
+            f"MT5, {config.symbol} için {config.lookback} adet veri çubuğunu döndüremedi."
+        )
+        if last_error:
+            error_text += f" Son MT5 hatası: {last_error}"
+        raise RuntimeError(error_text)
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
