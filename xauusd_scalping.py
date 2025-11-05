@@ -47,6 +47,8 @@ class StrategyConfig:
     macd_slow_period: int = 26
     macd_signal_period: int = 9
     reconnect_delay: int = 5  # seconds to wait before attempting reconnection
+    ema_cross_lookback: int = 4  # bars to consider a recent EMA crossover valid
+    macd_cross_lookback: int = 4  # bars to consider a recent MACD crossover valid
 
 
 @dataclass
@@ -133,16 +135,34 @@ class SignalEngine:
     @staticmethod
     def evaluate(prices: pd.DataFrame, position: Optional[str], config: StrategyConfig) -> SignalSnapshot:
         latest = prices.iloc[-1]
-        previous = prices.iloc[-2]
 
-        bullish_cross = previous["ema_fast"] <= previous["ema_slow"] and latest["ema_fast"] > latest["ema_slow"]
-        bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
+        bullish_cross_recent = SignalEngine._recent_cross(
+            prices["ema_fast"],
+            prices["ema_slow"],
+            config.ema_cross_lookback,
+            "up",
+        )
+        bearish_cross_recent = SignalEngine._recent_cross(
+            prices["ema_fast"],
+            prices["ema_slow"],
+            config.ema_cross_lookback,
+            "down",
+        )
 
         ema_diff = float(latest["ema_fast"] - latest["ema_slow"])
         macd_diff = float(latest["macd"] - latest["macd_signal"])
-        prev_macd_diff = float(previous["macd"] - previous["macd_signal"])
-        macd_cross_up = prev_macd_diff <= 0 <= macd_diff and macd_diff > 0
-        macd_cross_down = prev_macd_diff >= 0 >= macd_diff and macd_diff < 0
+        macd_cross_up_recent = SignalEngine._recent_cross(
+            prices["macd"],
+            prices["macd_signal"],
+            config.macd_cross_lookback,
+            "up",
+        )
+        macd_cross_down_recent = SignalEngine._recent_cross(
+            prices["macd"],
+            prices["macd_signal"],
+            config.macd_cross_lookback,
+            "down",
+        )
 
         ema_relation = ">" if latest["ema_fast"] > latest["ema_slow"] else "<" if latest["ema_fast"] < latest["ema_slow"] else "="
         macd_state = "bullish" if macd_diff > 0 else "bearish" if macd_diff < 0 else "neutral"
@@ -152,8 +172,8 @@ class SignalEngine:
 
         # Exit logic takes precedence when a position is open.
         if position == "long":
-            if bearish_cross or rsi_value >= config.rsi_overbought:
-                if bearish_cross:
+            if ema_diff <= 0 or bearish_cross_recent or rsi_value >= config.rsi_overbought:
+                if bearish_cross_recent or ema_diff <= 0:
                     notes.append("EMA crossover reversed")
                 if rsi_value >= config.rsi_overbought:
                     notes.append("RSI overbought")
@@ -167,8 +187,8 @@ class SignalEngine:
                     "; ".join(notes),
                 )
         elif position == "short":
-            if bullish_cross or rsi_value <= config.rsi_oversold:
-                if bullish_cross:
+            if ema_diff >= 0 or bullish_cross_recent or rsi_value <= config.rsi_oversold:
+                if bullish_cross_recent or ema_diff >= 0:
                     notes.append("EMA crossover reversed")
                 if rsi_value <= config.rsi_oversold:
                     notes.append("RSI oversold")
@@ -184,7 +204,13 @@ class SignalEngine:
 
         # Entry logic when flat.
         if position is None:
-            if bullish_cross and rsi_value > config.rsi_bull_threshold and macd_cross_up:
+            if (
+                bullish_cross_recent
+                and rsi_value > config.rsi_bull_threshold
+                and macd_cross_up_recent
+                and ema_diff > 0
+                and macd_diff > 0
+            ):
                 notes.extend(["9 EMA above 21 EMA", "RSI bullish", "MACD bull cross"])
                 return SignalSnapshot(
                     "BUY",
@@ -195,7 +221,13 @@ class SignalEngine:
                     macd_diff,
                     "; ".join(notes),
                 )
-            if bearish_cross and rsi_value < config.rsi_bear_threshold and macd_cross_down:
+            if (
+                bearish_cross_recent
+                and rsi_value < config.rsi_bear_threshold
+                and macd_cross_down_recent
+                and ema_diff < 0
+                and macd_diff < 0
+            ):
                 notes.extend(["9 EMA below 21 EMA", "RSI bearish", "MACD bear cross"])
                 return SignalSnapshot(
                     "SELL",
@@ -219,6 +251,18 @@ class SignalEngine:
         if action.startswith("EXIT"):
             return None
         return current
+
+    @staticmethod
+    def _recent_cross(series_a: pd.Series, series_b: pd.Series, lookback: int, direction: str) -> bool:
+        if lookback <= 0:
+            lookback = 1
+        diff = series_a - series_b
+        prev_diff = diff.shift(1)
+        if direction == "up":
+            crosses = (diff > 0) & (prev_diff <= 0)
+        else:
+            crosses = (diff < 0) & (prev_diff >= 0)
+        return bool(crosses.tail(lookback).any())
 
 
 class ScalpingBot:
