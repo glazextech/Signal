@@ -1,25 +1,24 @@
-"""Automated XAUUSD scalping signal generator using MetaTrader5.
+"""XAUUSD scalping analiz aracı (MetaTrader5).
 
-This module connects to MetaTrader 5, downloads recent price data for XAUUSD,
-computes fast technical indicators suitable for scalping, and emits trade
-signals.  The script is modular so you can either run it standalone or import
-`generate_signal` / `prepare_order_request` elsewhere.
+Bu modül MetaTrader 5 terminaline bağlanır, XAUUSD için son fiyat verilerini
+indirir, hızlı teknik indikatörleri hesaplar ve manuel işlemleriniz için
+öneri niteliğinde sinyal çıktısı sağlar. Herhangi bir otomatik emir gönderimi
+yapmaz; işlemlerinizi terminal içinde manuel olarak açmanız beklenir.
 
-Highlights:
-    * Can auto-launch the local MT5 terminal via `--terminal-path`.
-    * Works with an already logged-in MT5 session (no credentials needed).
-    * Optional `--account/--password/--server` arguments let you override and
-      re-login programmatically when desired.
+Öne çıkanlar:
+    * `--terminal-path` ile yerel MT5 terminalini otomatik başlatabilir.
+    * Halihazırda giriş yapılmış MT5 oturumuyla (şifre girmeden) çalışır.
+    * İsteğe bağlı `--account/--password/--server` argümanlarıyla API üzerinden
+      yeniden giriş yapabilirsiniz.
 
-Prerequisites:
+Gereksinimler:
     pip install MetaTrader5 pandas numpy
 
-IMPORTANT:
-    - Ensure MetaTrader 5 is installed, allowed for algo trading, and that the
-      terminal session is logged in if you skip credentials.
-    - Python architecture (32/64 bit) must match the MT5 terminal.
-    - Trading leveraged products carries significant risk; test thoroughly on
-      a demo account before deploying to live capital.
+Önemli:
+    - MT5 terminali yüklü, algoritmik işleme izin verilmiş ve (şifresiz modda
+      kullanacaksanız) broker hesabındaki oturumunuz açık olmalıdır.
+    - Python mimarisi (32/64 bit) MT5 terminaliyle eşleşmelidir.
+    - Kaldıraçlı ürünler yüksek risk taşır; önce demo hesapta test edin.
 """
 
 from __future__ import annotations
@@ -45,7 +44,6 @@ class StrategyConfig:
     symbol: str = "XAUUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     lookback: int = 600  # fetch ~10 hours of 1-minute candles
-    lot: float = 0.10
     max_spread_points: float = 30.0
     risk_per_trade: float = 0.005  # 0.5% of equity
     atr_period: int = 14
@@ -59,6 +57,7 @@ class StrategyConfig:
     password: Optional[str] = None
     server: Optional[str] = None
     terminal_path: Optional[str] = None
+    lot: float = 0.10  # fallback lot kullanıcının manuel değerlendirmesi için
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +70,14 @@ def initialize_mt5(config: StrategyConfig) -> None:
 
     init_kwargs = {"path": config.terminal_path} if config.terminal_path else {}
     if not mt5.initialize(**init_kwargs):
-        raise RuntimeError(f"MT5 initialize() failed, error code: {mt5.last_error()}")
+        error = mt5.last_error()
+        if error and error[0] == -6:
+            raise RuntimeError(
+                "MT5 initialize() yetkilendirme hatası (-6). Terminali manuel olarak açıp broker hesabınıza giriş yapın "
+                "ve tekrar deneyin. Eğer terminali otomatik başlatmak istiyorsanız --terminal-path ile terminal64.exe yolunu "
+                "verip hesabın giriş bilgilerinin terminalde kayıtlı olduğundan emin olun."
+            )
+        raise RuntimeError(f"MT5 initialize() failed, error code: {error}")
 
     if config.account and config.password and config.server:
         authorized = mt5.login(config.account, password=config.password, server=config.server)
@@ -208,39 +214,21 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     return None
 
 
-def prepare_order_request(signal: TradeSignal, config: StrategyConfig) -> dict:
-    """Build a ready-to-submit MT5 order request payload."""
+def format_signal(signal: TradeSignal, config: StrategyConfig) -> str:
+    """İnsan tarafından okunabilir sinyal çıktısı üret."""
 
-    symbol_info = mt5.symbol_info(config.symbol)
-    if symbol_info is None:
-        raise RuntimeError(f"Symbol info for {config.symbol} not available")
-
-    sl_points = abs(signal.entry - signal.stop_loss) / symbol_info.point
-    account_info = mt5.account_info()
-    if account_info and symbol_info.trade_tick_value:
-        volume = max(
-            round((config.risk_per_trade * account_info.equity) / (sl_points * symbol_info.trade_tick_value), 2),
-            0.01,
-        )
-    else:
-        volume = config.lot
-
-    volume = min(volume, symbol_info.volume_max)
-
-    return {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": config.symbol,
-        "volume": volume,
-        "type": mt5.ORDER_TYPE_BUY if signal.direction == "buy" else mt5.ORDER_TYPE_SELL,
-        "price": signal.entry,
-        "sl": signal.stop_loss,
-        "tp": signal.take_profit,
-        "deviation": 10,
-        "magic": 50817,
-        "comment": signal.comment,
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": symbol_info.filling_mode,
-    }
+    direction = "AL" if signal.direction == "buy" else "SAT"
+    lines = [
+        f"Sinyal: {direction}",
+        f"Zaman: {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Giriş fiyatı: {signal.entry:.2f}",
+        f"Stop-loss:   {signal.stop_loss:.2f}",
+        f"Take-profit: {signal.take_profit:.2f}",
+        f"Not: {signal.comment}",
+    ]
+    if config.lot:
+        lines.append(f"Önerilen lot referansı (manuel değerlendirme): {config.lot:.2f}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +246,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Absolute path to terminal64.exe (auto-launch MT5 if given)",
     )
-    parser.add_argument("--lots", type=float, default=0.10, help="Fallback lot size for order template")
+    parser.add_argument("--lots", type=float, default=0.10, help="Manuel işlemde referans alacağınız lot değeri")
     parser.add_argument(
         "--max-spread",
         type=float,
@@ -307,16 +295,7 @@ def main() -> None:
         signal = generate_signal(enriched, config)
 
         if signal:
-            request = prepare_order_request(signal, config)
-            logging.info(
-                "Signal: %s | entry=%.2f sl=%.2f tp=%.2f | comment=%s",
-                signal.direction.upper(),
-                signal.entry,
-                signal.stop_loss,
-                signal.take_profit,
-                signal.comment,
-            )
-            logging.info("Suggested order payload: %s", request)
+            logging.info("Sinyal bulundu:\n%s", format_signal(signal, config))
         else:
             logging.info("No valid signal at %s", datetime.now(timezone.utc))
 
