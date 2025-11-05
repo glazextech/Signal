@@ -53,6 +53,10 @@ class StrategyConfig:
     rsi_upper: float = 65.0
     rsi_lower: float = 35.0
     reward_risk_ratio: float = 1.5
+    min_rsi_separation: float = 1.0  # RSI'nin yönsel olarak 50 seviyesinden sapması gereken minimum fark
+    min_rsi_trend_delta: float = 0.15  # RSI momentumunun yönsel teyidi için minimum değişim
+    min_ema_gap_atr_ratio: float = 0.12  # EMA farkının ATR'a oranla minimum büyüklüğü
+    min_close_distance_atr_ratio: float = 0.05  # Fiyatın yavaş EMA'dan ATR oranlı minimum uzaklığı
     account: Optional[int] = None
     password: Optional[str] = None
     server: Optional[str] = None
@@ -184,8 +188,32 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
     atr_points = latest["atr"]
+    if atr_points is None or np.isnan(atr_points) or atr_points <= 0:
+        logging.debug("ATR değeri geçersiz veya 0, sinyal oluşturulamıyor.")
+        return None
 
-    if bullish_cross and latest["rsi"] < config.rsi_upper:
+    ema_gap = latest["ema_fast"] - latest["ema_slow"]
+    ema_gap_strength = abs(ema_gap)
+    ema_gap_min = config.min_ema_gap_atr_ratio * atr_points
+
+    close_distance = latest["close"] - latest["ema_slow"]
+    bearish_close_distance = latest["ema_slow"] - latest["close"]
+    min_close_distance = config.min_close_distance_atr_ratio * atr_points
+
+    rsi_bias = latest["rsi"] - 50.0
+    rsi_trend = latest["rsi"] - previous["rsi"]
+    price_momentum = latest["close"] - previous["close"]
+
+    if (
+        bullish_cross
+        and ema_gap > 0
+        and ema_gap_strength >= ema_gap_min
+        and close_distance >= min_close_distance
+        and price_momentum > 0
+        and rsi_trend >= config.min_rsi_trend_delta
+        and rsi_bias >= config.min_rsi_separation
+        and latest["rsi"] <= config.rsi_upper
+    ):
         entry = latest["ask"]
         stop_loss = entry - 1.5 * atr_points
         take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
@@ -198,7 +226,16 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
             comment="EMA bull cross + RSI filter",
         )
 
-    if bearish_cross and latest["rsi"] > config.rsi_lower:
+    if (
+        bearish_cross
+        and ema_gap < 0
+        and ema_gap_strength >= ema_gap_min
+        and bearish_close_distance >= min_close_distance
+        and price_momentum < 0
+        and rsi_trend <= -config.min_rsi_trend_delta
+        and rsi_bias <= -config.min_rsi_separation
+        and latest["rsi"] >= config.rsi_lower
+    ):
         entry = latest["bid"]
         stop_loss = entry + 1.5 * atr_points
         take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
