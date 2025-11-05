@@ -34,6 +34,9 @@ import numpy as np
 import pandas as pd
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -87,9 +90,9 @@ def initialize_mt5(config: StrategyConfig) -> None:
             raise RuntimeError(
                 f"MT5 login failed (account={config.account}), error: {last_error}"
             )
-        logging.info("Logged in to MT5 account %s via API", config.account)
+        _LOGGER.info("Logged in to MT5 account %s via API", config.account)
     else:
-        logging.info("Using existing MT5 terminal session (no credentials supplied)")
+        _LOGGER.info("Using existing MT5 terminal session (no credentials supplied)")
 
 
 def shutdown_mt5() -> None:
@@ -112,8 +115,13 @@ def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
         raise RuntimeError(f"Failed to fetch rates for {config.symbol}: {mt5.last_error()}")
 
     df = pd.DataFrame(rates)
+    if df.empty:
+        raise RuntimeError(f"No rates returned for {config.symbol} (zero-length dataset)")
+
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df.set_index("time", inplace=True)
+    df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
     return df
 
 
@@ -125,7 +133,13 @@ def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
 def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     """Append EMA, RSI, ATR indicators to the price DataFrame."""
 
-    prices = df.copy()
+    prices = df.sort_index().copy()
+
+    required_bars = max(config.ema_slow_period, config.rsi_period, config.atr_period) + 1
+    if len(prices) < required_bars:
+        raise ValueError(
+            f"Indicator hesaplamaları için yeterli veri yok (gereken: {required_bars}, mevcut: {len(prices)})"
+        )
 
     prices["ema_fast"] = prices["close"].ewm(span=config.ema_fast_period, adjust=False).mean()
     prices["ema_slow"] = prices["close"].ewm(span=config.ema_slow_period, adjust=False).mean()
@@ -133,8 +147,10 @@ def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame
     delta = prices["close"].diff()
     gain = (delta.clip(lower=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
+    loss = loss.replace(0, np.nan)
+    rs = gain / loss
     prices["rsi"] = 100 - (100 / (1 + rs))
+    prices["rsi"] = prices["rsi"].clip(lower=0, upper=100)
 
     tr = np.maximum(
         prices["high"] - prices["low"],
@@ -143,7 +159,7 @@ def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame
             prices["close"].shift(1) - prices["low"],
         ),
     )
-    prices["atr"] = tr.rolling(window=config.atr_period, min_periods=1).mean()
+    prices["atr"] = tr.ewm(span=config.atr_period, adjust=False).mean()
 
     return prices
 
@@ -166,17 +182,46 @@ class TradeSignal:
 def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[TradeSignal]:
     """Generate a trade signal based on EMA crossover + RSI filter + volatility."""
 
+    if len(prices.index) < 2:
+        _LOGGER.debug("Not enough bars (%d) to generate a signal", len(prices))
+        return None
+
+    for column in ("ema_fast", "ema_slow", "rsi", "atr"):
+        if column not in prices.columns:
+            _LOGGER.debug("Column %s missing from price DataFrame; skipping signal", column)
+            return None
+
     latest = prices.iloc[-1]
     previous = prices.iloc[-2]
 
-    symbol_info = mt5.symbol_info(config.symbol)
-    if symbol_info is None:
-        logging.warning("Symbol info for %s unavailable; cannot compute signal", config.symbol)
+    latest_bid = float(latest.get("bid", latest["close"]))
+    latest_ask = float(latest.get("ask", latest["close"]))
+
+    if any(np.isnan([latest_bid, latest_ask])):
+        _LOGGER.debug("Bid/ask verisi eksik; sinyal üretimi atlandı")
         return None
 
-    spread_points = (latest["ask"] - latest["bid"]) / symbol_info.point
+    if pd.isna(latest["atr"]):
+        _LOGGER.debug("ATR bilgisi mevcut değil; sinyal üretimi atlandı")
+        return None
+
+    indicator_slice = prices[["ema_fast", "ema_slow", "rsi", "atr"]].tail(2)
+    if indicator_slice.isna().any().any():
+        _LOGGER.debug("Gerekli indikatör değerleri NaN içeriyor; sinyal atlandı")
+        return None
+
+    symbol_info = mt5.symbol_info(config.symbol)
+    if symbol_info is None:
+        _LOGGER.warning("Symbol info for %s unavailable; cannot compute signal", config.symbol)
+        return None
+
+    spread_points = (latest_ask - latest_bid) / symbol_info.point
     if spread_points > config.max_spread_points:
-        logging.info("Spread %.1f exceeds threshold %.1f, skipping signal.", spread_points, config.max_spread_points)
+        _LOGGER.info(
+            "Spread %.1f exceeds threshold %.1f, skipping signal.",
+            spread_points,
+            config.max_spread_points,
+        )
         return None
 
     # EMA crossover logic
@@ -186,7 +231,7 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     atr_points = latest["atr"]
 
     if bullish_cross and latest["rsi"] < config.rsi_upper:
-        entry = latest["ask"]
+        entry = latest_ask
         stop_loss = entry - 1.5 * atr_points
         take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
         return TradeSignal(
@@ -199,7 +244,7 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
         )
 
     if bearish_cross and latest["rsi"] > config.rsi_lower:
-        entry = latest["bid"]
+        entry = latest_bid
         stop_loss = entry + 1.5 * atr_points
         take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
         return TradeSignal(
@@ -281,23 +326,29 @@ def main() -> None:
 
     try:
         initialize_mt5(config)
-        logging.info("MT5 terminal initialised")
+        _LOGGER.info("MT5 terminal initialised")
 
         raw = fetch_rates(config)
-        symbol_info = mt5.symbol_info_tick(config.symbol)
-        if symbol_info is None:
+        tick_info = mt5.symbol_info_tick(config.symbol)
+        if tick_info is None:
             raise RuntimeError(f"Symbol tick info for {config.symbol} unavailable")
 
-        raw["bid"] = symbol_info.bid
-        raw["ask"] = symbol_info.ask
+        raw = raw.copy()
+        raw.loc[raw.index[-1], "bid"] = tick_info.bid
+        raw.loc[raw.index[-1], "ask"] = tick_info.ask
 
-        enriched = compute_indicators(raw, config)
+        try:
+            enriched = compute_indicators(raw, config)
+        except ValueError as indicator_error:
+            _LOGGER.warning("Indicator hesaplaması atlandı: %s", indicator_error)
+            return
+
         signal = generate_signal(enriched, config)
 
         if signal:
-            logging.info("Sinyal bulundu:\n%s", format_signal(signal, config))
+            _LOGGER.info("Sinyal bulundu:\n%s", format_signal(signal, config))
         else:
-            logging.info("No valid signal at %s", datetime.now(timezone.utc))
+            _LOGGER.info("No valid signal at %s", datetime.now(timezone.utc))
 
     finally:
         shutdown_mt5()
