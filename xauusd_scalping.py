@@ -1,24 +1,23 @@
 """Automated XAUUSD scalping signal generator using MetaTrader5.
 
-This module connects to a running MetaTrader 5 terminal, downloads recent
-price data for XAUUSD, computes a set of fast technical indicators that are
-well-suited to intraday scalping, and emits actionable trade signals.  The
-script is intentionally modular so you can either:
+This module connects to MetaTrader 5, downloads recent price data for XAUUSD,
+computes fast technical indicators suitable for scalping, and emits trade
+signals.  The script is modular so you can either run it standalone or import
+`generate_signal` / `prepare_order_request` elsewhere.
 
-* run it as a standalone helper that simply prints the latest signal, or
-* import the module and integrate `generate_signal` / `prepare_order_request`
-  into a larger trade-management workflow.
-
-Usage (shell):
-    python xauusd_scalping.py --account 123456 --password secret --server "Broker-Server"
+Highlights:
+    * Can auto-launch the local MT5 terminal via `--terminal-path`.
+    * Works with an already logged-in MT5 session (no credentials needed).
+    * Optional `--account/--password/--server` arguments let you override and
+      re-login programmatically when desired.
 
 Prerequisites:
     pip install MetaTrader5 pandas numpy
 
 IMPORTANT:
-    - Make sure MetaTrader 5 is installed and logged in to the broker account.
-    - Allow algorithmic trading in the MT5 terminal.
-    - Run Python in the same architecture (32/64 bit) as the MT5 terminal.
+    - Ensure MetaTrader 5 is installed, allowed for algo trading, and that the
+      terminal session is logged in if you skip credentials.
+    - Python architecture (32/64 bit) must match the MT5 terminal.
     - Trading leveraged products carries significant risk; test thoroughly on
       a demo account before deploying to live capital.
 """
@@ -43,12 +42,9 @@ import pandas as pd
 
 @dataclass
 class StrategyConfig:
-    account: int
-    password: str
-    server: str
     symbol: str = "XAUUSD"
     timeframe: int = mt5.TIMEFRAME_M1
-    lookback: int = 600  # fetch 10 hours of 1-minute candles
+    lookback: int = 600  # fetch ~10 hours of 1-minute candles
     lot: float = 0.10
     max_spread_points: float = 30.0
     risk_per_trade: float = 0.005  # 0.5% of equity
@@ -59,6 +55,10 @@ class StrategyConfig:
     rsi_upper: float = 65.0
     rsi_lower: float = 35.0
     reward_risk_ratio: float = 1.5
+    account: Optional[int] = None
+    password: Optional[str] = None
+    server: Optional[str] = None
+    terminal_path: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -67,18 +67,23 @@ class StrategyConfig:
 
 
 def initialize_mt5(config: StrategyConfig) -> None:
-    """Initialise MT5 terminal and login to the account."""
+    """Initialise MT5 terminal, optionally auto-launching and logging in."""
 
-    if not mt5.initialize():
+    init_kwargs = {"path": config.terminal_path} if config.terminal_path else {}
+    if not mt5.initialize(**init_kwargs):
         raise RuntimeError(f"MT5 initialize() failed, error code: {mt5.last_error()}")
 
-    authorized = mt5.login(config.account, password=config.password, server=config.server)
-    if not authorized:
-        last_error = mt5.last_error()
-        mt5.shutdown()
-        raise RuntimeError(
-            f"MT5 login failed (account={config.account}), error: {last_error}"
-        )
+    if config.account and config.password and config.server:
+        authorized = mt5.login(config.account, password=config.password, server=config.server)
+        if not authorized:
+            last_error = mt5.last_error()
+            mt5.shutdown()
+            raise RuntimeError(
+                f"MT5 login failed (account={config.account}), error: {last_error}"
+            )
+        logging.info("Logged in to MT5 account %s via API", config.account)
+    else:
+        logging.info("Using existing MT5 terminal session (no credentials supplied)")
 
 
 def shutdown_mt5() -> None:
@@ -158,7 +163,12 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     latest = prices.iloc[-1]
     previous = prices.iloc[-2]
 
-    spread_points = (latest["ask"] - latest["bid"]) / mt5.symbol_info(config.symbol).point
+    symbol_info = mt5.symbol_info(config.symbol)
+    if symbol_info is None:
+        logging.warning("Symbol info for %s unavailable; cannot compute signal", config.symbol)
+        return None
+
+    spread_points = (latest["ask"] - latest["bid"]) / symbol_info.point
     if spread_points > config.max_spread_points:
         logging.info("Spread %.1f exceeds threshold %.1f, skipping signal.", spread_points, config.max_spread_points)
         return None
@@ -168,7 +178,6 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
     atr_points = latest["atr"]
-    point = mt5.symbol_info(config.symbol).point
 
     if bullish_cross and latest["rsi"] < config.rsi_upper:
         entry = latest["ask"]
@@ -207,15 +216,21 @@ def prepare_order_request(signal: TradeSignal, config: StrategyConfig) -> dict:
         raise RuntimeError(f"Symbol info for {config.symbol} not available")
 
     sl_points = abs(signal.entry - signal.stop_loss) / symbol_info.point
-    volume = max(
-        round((config.risk_per_trade * mt5.account_info().equity) / (sl_points * symbol_info.trade_tick_value), 2),
-        0.01,
-    )
+    account_info = mt5.account_info()
+    if account_info and symbol_info.trade_tick_value:
+        volume = max(
+            round((config.risk_per_trade * account_info.equity) / (sl_points * symbol_info.trade_tick_value), 2),
+            0.01,
+        )
+    else:
+        volume = config.lot
+
+    volume = min(volume, symbol_info.volume_max)
 
     return {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": config.symbol,
-        "volume": volume if volume <= symbol_info.volume_max else symbol_info.volume_max,
+        "volume": volume,
         "type": mt5.ORDER_TYPE_BUY if signal.direction == "buy" else mt5.ORDER_TYPE_SELL,
         "price": signal.entry,
         "sl": signal.stop_loss,
@@ -235,10 +250,15 @@ def prepare_order_request(signal: TradeSignal, config: StrategyConfig) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MetaTrader5 XAUUSD scalping signal generator")
-    parser.add_argument("--account", type=int, required=True)
-    parser.add_argument("--password", type=str, required=True)
-    parser.add_argument("--server", type=str, required=True)
-    parser.add_argument("--lots", type=float, default=0.10, help="Default lot size for order template")
+    parser.add_argument("--account", type=int, help="Override account login (optional)")
+    parser.add_argument("--password", type=str, help="Override account password (optional)")
+    parser.add_argument("--server", type=str, help="Override trade server name (optional)")
+    parser.add_argument(
+        "--terminal-path",
+        type=str,
+        help="Absolute path to terminal64.exe (auto-launch MT5 if given)",
+    )
+    parser.add_argument("--lots", type=float, default=0.10, help="Fallback lot size for order template")
     parser.add_argument(
         "--max-spread",
         type=float,
@@ -266,13 +286,14 @@ def main() -> None:
         account=args.account,
         password=args.password,
         server=args.server,
+        terminal_path=args.terminal_path,
         lot=args.lots,
         max_spread_points=args.max_spread,
     )
 
     try:
         initialize_mt5(config)
-        logging.info("Connected to MT5 and authenticated (account: %s)", config.account)
+        logging.info("MT5 terminal initialised")
 
         raw = fetch_rates(config)
         symbol_info = mt5.symbol_info_tick(config.symbol)
