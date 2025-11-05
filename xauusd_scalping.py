@@ -2,9 +2,11 @@
 
 This script connects to a running MetaTrader 5 terminal, loads 1-minute gold
 price data, calculates EMA crossover, RSI confirmation, and MACD confirmation,
-and prints actionable BUY/SELL/HOLD signals every minute. The logic is designed
-for manual trading; no orders are sent to MT5. All parameters are collected in a
-configuration dataclass so you can easily tweak indicator periods or thresholds.
+and prints actionable BUY/SELL/EXIT signals when they occur. In between signals
+it streams real-time price diagnostics so you always see the latest market
+context. The logic is designed for manual trading; no orders are sent to MT5.
+All parameters are collected in a configuration dataclass so you can easily
+tweak indicator periods or thresholds.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import argparse
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import MetaTrader5 as mt5  # type: ignore
@@ -33,7 +35,7 @@ class StrategyConfig:
     symbol: str = "XAUUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     history_bars: int = 400  # ~6.5 hours of data to stabilise indicators
-    update_interval: int = 60  # seconds between signal evaluations
+    update_interval: int = 5  # seconds between signal evaluations
     ema_fast_period: int = 9
     ema_slow_period: int = 21
     rsi_period: int = 14
@@ -55,6 +57,8 @@ class SignalSnapshot:
     ema_relation: str
     rsi_value: float
     macd_state: str
+    ema_diff: float
+    macd_diff: float
     notes: str = ""
 
 
@@ -134,8 +138,9 @@ class SignalEngine:
         bullish_cross = previous["ema_fast"] <= previous["ema_slow"] and latest["ema_fast"] > latest["ema_slow"]
         bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
-        macd_diff = latest["macd"] - latest["macd_signal"]
-        prev_macd_diff = previous["macd"] - previous["macd_signal"]
+        ema_diff = float(latest["ema_fast"] - latest["ema_slow"])
+        macd_diff = float(latest["macd"] - latest["macd_signal"])
+        prev_macd_diff = float(previous["macd"] - previous["macd_signal"])
         macd_cross_up = prev_macd_diff <= 0 <= macd_diff and macd_diff > 0
         macd_cross_down = prev_macd_diff >= 0 >= macd_diff and macd_diff < 0
 
@@ -152,26 +157,58 @@ class SignalEngine:
                     notes.append("EMA crossover reversed")
                 if rsi_value >= config.rsi_overbought:
                     notes.append("RSI overbought")
-                return SignalSnapshot("EXIT LONG", ema_relation, rsi_value, macd_state, "; ".join(notes))
+                return SignalSnapshot(
+                    "EXIT LONG",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
         elif position == "short":
             if bullish_cross or rsi_value <= config.rsi_oversold:
                 if bullish_cross:
                     notes.append("EMA crossover reversed")
                 if rsi_value <= config.rsi_oversold:
                     notes.append("RSI oversold")
-                return SignalSnapshot("EXIT SHORT", ema_relation, rsi_value, macd_state, "; ".join(notes))
+                return SignalSnapshot(
+                    "EXIT SHORT",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
 
         # Entry logic when flat.
         if position is None:
             if bullish_cross and rsi_value > config.rsi_bull_threshold and macd_cross_up:
                 notes.extend(["9 EMA above 21 EMA", "RSI bullish", "MACD bull cross"])
-                return SignalSnapshot("BUY", ema_relation, rsi_value, macd_state, "; ".join(notes))
+                return SignalSnapshot(
+                    "BUY",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
             if bearish_cross and rsi_value < config.rsi_bear_threshold and macd_cross_down:
                 notes.extend(["9 EMA below 21 EMA", "RSI bearish", "MACD bear cross"])
-                return SignalSnapshot("SELL", ema_relation, rsi_value, macd_state, "; ".join(notes))
+                return SignalSnapshot(
+                    "SELL",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
 
         # Otherwise hold position (open positions keep status quo).
-        return SignalSnapshot("HOLD", ema_relation, rsi_value, macd_state)
+        return SignalSnapshot("HOLD", ema_relation, rsi_value, macd_state, ema_diff, macd_diff)
 
     @staticmethod
     def next_position(current: Optional[str], action: str) -> Optional[str]:
@@ -200,12 +237,26 @@ class ScalpingBot:
                 cycle_start = time.time()
                 try:
                     prices = self._load_prices()
+                    tick = self._latest_tick()
                     enriched = IndicatorCalculator.enrich(prices, self.config)
                     if len(enriched) < 2:
                         raise RuntimeError("Not enough data points after indicator warm-up")
 
                     signal = SignalEngine.evaluate(enriched, self.position, self.config)
-                    self._print_signal(signal)
+                    latest_row = enriched.iloc[-1]
+                    latest_price = self._price_from_tick(tick)
+                    tick_epoch = (
+                        getattr(tick, "time_msc", 0) / 1000
+                        if getattr(tick, "time_msc", 0)
+                        else getattr(tick, "time", time.time())
+                    )
+                    tick_time = datetime.fromtimestamp(tick_epoch, tz=timezone.utc)
+
+                    self._print_price(latest_price, latest_row, tick_time)
+
+                    if signal.action != "HOLD":
+                        self._print_signal(signal, latest_price, tick_time)
+
                     self.position = SignalEngine.next_position(self.position, signal.action)
                 except Exception as error:  # broad on purpose so the loop keeps running
                     logging.exception("Signal evaluation failed: %s", error)
@@ -230,6 +281,24 @@ class ScalpingBot:
         time.sleep(self.config.reconnect_delay)
         self._connect()
 
+    def _latest_tick(self) -> mt5.Tick:
+        tick = mt5.symbol_info_tick(self.config.symbol)
+        if tick is None:
+            raise RuntimeError(f"Unable to fetch latest tick for {self.config.symbol}: {mt5.last_error()}")
+        return tick
+
+    @staticmethod
+    def _price_from_tick(tick: mt5.Tick) -> float:
+        if getattr(tick, "last", 0.0):
+            return float(tick.last)
+        if getattr(tick, "bid", 0.0) and getattr(tick, "ask", 0.0):
+            return float((tick.bid + tick.ask) / 2)
+        if getattr(tick, "bid", 0.0):
+            return float(tick.bid)
+        if getattr(tick, "ask", 0.0):
+            return float(tick.ask)
+        raise RuntimeError("Tick does not contain price information")
+
     def _load_prices(self) -> pd.DataFrame:
         rates = mt5.copy_rates_from_pos(
             self.config.symbol,
@@ -245,12 +314,26 @@ class ScalpingBot:
         frame.set_index("time", inplace=True)
         return frame
 
-    def _print_signal(self, signal: SignalSnapshot) -> None:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        ema_text = f"EMA: {self.config.ema_fast_period}{signal.ema_relation}{self.config.ema_slow_period}"
-        rsi_text = f"RSI: {signal.rsi_value:.2f}"
-        macd_text = f"MACD: {signal.macd_state}"
-        parts = [f"[{timestamp}] Signal: {signal.action}", ema_text, rsi_text, macd_text]
+    def _print_price(self, price: float, latest_row: pd.Series, ts: datetime) -> None:
+        ema_diff = float(latest_row["ema_fast"] - latest_row["ema_slow"])
+        macd_diff = float(latest_row["macd"] - latest_row["macd_signal"])
+        line = (
+            f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] Price: {price:.2f} | "
+            f"EMA: {self.config.ema_fast_period}{'>' if ema_diff > 0 else '<' if ema_diff < 0 else '='}{self.config.ema_slow_period} "
+            f"(diff {ema_diff:.4f}) | RSI: {latest_row['rsi']:.2f} | "
+            f"MACD: {'bullish' if macd_diff > 0 else 'bearish' if macd_diff < 0 else 'neutral'} "
+            f"(diff {macd_diff:.4f})"
+        )
+        print(line, flush=True)
+
+    def _print_signal(self, signal: SignalSnapshot, price: float, ts: datetime) -> None:
+        parts = [
+            f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] Signal: {signal.action}",
+            f"Price: {price:.2f}",
+            f"EMA: {self.config.ema_fast_period}{signal.ema_relation}{self.config.ema_slow_period} (diff {signal.ema_diff:.4f})",
+            f"RSI: {signal.rsi_value:.2f}",
+            f"MACD: {signal.macd_state} (diff {signal.macd_diff:.4f})",
+        ]
         if signal.notes:
             parts.append(f"Notes: {signal.notes}")
         print(" | ".join(parts), flush=True)
@@ -266,7 +349,7 @@ def parse_args() -> argparse.Namespace:
         description="Generate manual scalping signals for XAUUSD on a 1-minute chart",
     )
     parser.add_argument("--history", type=int, default=400, help="Number of 1-minute bars to fetch each cycle")
-    parser.add_argument("--interval", type=int, default=60, help="Seconds between signal refreshes (default: 60)")
+    parser.add_argument("--interval", type=int, default=5, help="Seconds between signal refreshes (default: 5)")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
