@@ -1,30 +1,19 @@
-"""XAUUSD scalping analiz aracı (MetaTrader5).
+"""MetaTrader 5 XAUUSD scalping signal generator.
 
-Bu modül MetaTrader 5 terminaline bağlanır, XAUUSD için son fiyat verilerini
-indirir, hızlı teknik indikatörleri hesaplar ve manuel işlemleriniz için
-öneri niteliğinde sinyal çıktısı sağlar. Herhangi bir otomatik emir gönderimi
-yapmaz; işlemlerinizi terminal içinde manuel olarak açmanız beklenir.
-
-Öne çıkanlar:
-    * `--terminal-path` ile yerel MT5 terminalini otomatik başlatabilir.
-    * Halihazırda giriş yapılmış MT5 oturumuyla (şifre girmeden) çalışır.
-    * İsteğe bağlı `--account/--password/--server` argümanlarıyla API üzerinden
-      yeniden giriş yapabilirsiniz.
-
-Gereksinimler:
-    pip install MetaTrader5 pandas numpy
-
-Önemli:
-    - MT5 terminali yüklü, algoritmik işleme izin verilmiş ve (şifresiz modda
-      kullanacaksanız) broker hesabındaki oturumunuz açık olmalıdır.
-    - Python mimarisi (32/64 bit) MT5 terminaliyle eşleşmelidir.
-    - Kaldıraçlı ürünler yüksek risk taşır; önce demo hesapta test edin.
+This script connects to a running MetaTrader 5 terminal, loads 1-minute gold
+price data, calculates EMA crossover, RSI confirmation, and MACD confirmation,
+and prints actionable BUY/SELL/EXIT signals when they occur. In between signals
+it streams real-time price diagnostics so you always see the latest market
+context. The logic is designed for manual trading; no orders are sent to MT5.
+All parameters are collected in a configuration dataclass so you can easily
+tweak indicator periods or thresholds.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -33,231 +22,379 @@ import MetaTrader5 as mt5  # type: ignore
 import numpy as np
 import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+try:  # Prefer TA-Lib if available; fall back to pandas implementations otherwise.
+    import talib  # type: ignore
+except ImportError:  # pragma: no cover - TA-Lib may not be installed locally.
+    talib = None
 
 
 @dataclass
 class StrategyConfig:
+    """Runtime parameters for the scalping bot."""
+
     symbol: str = "XAUUSD"
     timeframe: int = mt5.TIMEFRAME_M1
-    lookback: int = 600  # fetch ~10 hours of 1-minute candles
-    max_spread_points: float = 30.0
-    risk_per_trade: float = 0.005  # 0.5% of equity
-    atr_period: int = 14
+    history_bars: int = 400  # ~6.5 hours of data to stabilise indicators
+    update_interval: int = 5  # seconds between signal evaluations
     ema_fast_period: int = 9
     ema_slow_period: int = 21
     rsi_period: int = 14
-    rsi_upper: float = 65.0
-    rsi_lower: float = 35.0
-    reward_risk_ratio: float = 1.5
-    account: Optional[int] = None
-    password: Optional[str] = None
-    server: Optional[str] = None
-    terminal_path: Optional[str] = None
-    lot: float = 0.10  # fallback lot kullanıcının manuel değerlendirmesi için
-
-
-# ---------------------------------------------------------------------------
-# MT5 helpers
-# ---------------------------------------------------------------------------
-
-
-def initialize_mt5(config: StrategyConfig) -> None:
-    """Initialise MT5 terminal, optionally auto-launching and logging in."""
-
-    init_kwargs = {"path": config.terminal_path} if config.terminal_path else {}
-    if not mt5.initialize(**init_kwargs):
-        error = mt5.last_error()
-        if error and error[0] == -6:
-            raise RuntimeError(
-                "MT5 initialize() yetkilendirme hatası (-6). Terminali manuel olarak açıp broker hesabınıza giriş yapın "
-                "ve tekrar deneyin. Eğer terminali otomatik başlatmak istiyorsanız --terminal-path ile terminal64.exe yolunu "
-                "verip hesabın giriş bilgilerinin terminalde kayıtlı olduğundan emin olun."
-            )
-        raise RuntimeError(f"MT5 initialize() failed, error code: {error}")
-
-    if config.account and config.password and config.server:
-        authorized = mt5.login(config.account, password=config.password, server=config.server)
-        if not authorized:
-            last_error = mt5.last_error()
-            mt5.shutdown()
-            raise RuntimeError(
-                f"MT5 login failed (account={config.account}), error: {last_error}"
-            )
-        logging.info("Logged in to MT5 account %s via API", config.account)
-    else:
-        logging.info("Using existing MT5 terminal session (no credentials supplied)")
-
-
-def shutdown_mt5() -> None:
-    """Gracefully close MT5 API connection."""
-
-    mt5.shutdown()
-
-
-def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
-    """Fetch recent price candles for the configured symbol/timeframe."""
-
-    rates = mt5.copy_rates_from_pos(
-        config.symbol,
-        config.timeframe,
-        0,
-        config.lookback,
-    )
-
-    if rates is None or len(rates) == 0:
-        raise RuntimeError(f"Failed to fetch rates for {config.symbol}: {mt5.last_error()}")
-
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df.set_index("time", inplace=True)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Indicator engine
-# ---------------------------------------------------------------------------
-
-
-def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
-    """Append EMA, RSI, ATR indicators to the price DataFrame."""
-
-    prices = df.copy()
-
-    prices["ema_fast"] = prices["close"].ewm(span=config.ema_fast_period, adjust=False).mean()
-    prices["ema_slow"] = prices["close"].ewm(span=config.ema_slow_period, adjust=False).mean()
-
-    delta = prices["close"].diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    prices["rsi"] = 100 - (100 / (1 + rs))
-
-    tr = np.maximum(
-        prices["high"] - prices["low"],
-        np.maximum(
-            prices["high"] - prices["close"].shift(1),
-            prices["close"].shift(1) - prices["low"],
-        ),
-    )
-    prices["atr"] = tr.rolling(window=config.atr_period, min_periods=1).mean()
-
-    return prices
-
-
-# ---------------------------------------------------------------------------
-# Signal generation
-# ---------------------------------------------------------------------------
+    rsi_bull_threshold: float = 50.0
+    rsi_bear_threshold: float = 50.0
+    rsi_overbought: float = 70.0
+    rsi_oversold: float = 30.0
+    macd_fast_period: int = 12
+    macd_slow_period: int = 26
+    macd_signal_period: int = 9
+    reconnect_delay: int = 5  # seconds to wait before attempting reconnection
+    ema_cross_lookback: int = 4  # bars to consider a recent EMA crossover valid
+    macd_cross_lookback: int = 4  # bars to consider a recent MACD crossover valid
 
 
 @dataclass
-class TradeSignal:
-    direction: str
-    timestamp: datetime
-    entry: float
-    stop_loss: float
-    take_profit: float
-    comment: str
+class SignalSnapshot:
+    """Container for the signal decision and diagnostic context."""
+
+    action: str
+    ema_relation: str
+    rsi_value: float
+    macd_state: str
+    ema_diff: float
+    macd_diff: float
+    notes: str = ""
 
 
-def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[TradeSignal]:
-    """Generate a trade signal based on EMA crossover + RSI filter + volatility."""
+class IndicatorCalculator:
+    """Utility helpers for computing EMA, RSI, MACD with optional TA-Lib support."""
 
-    latest = prices.iloc[-1]
-    previous = prices.iloc[-2]
+    @staticmethod
+    def ema(series: pd.Series, period: int) -> pd.Series:
+        if talib is not None:
+            values = talib.EMA(series.values.astype(float), timeperiod=period)
+            return pd.Series(values, index=series.index, dtype=float)
+        return series.ewm(span=period, adjust=False).mean()
 
-    symbol_info = mt5.symbol_info(config.symbol)
-    if symbol_info is None:
-        logging.warning("Symbol info for %s unavailable; cannot compute signal", config.symbol)
-        return None
+    @staticmethod
+    def rsi(series: pd.Series, period: int) -> pd.Series:
+        if talib is not None:
+            values = talib.RSI(series.values.astype(float), timeperiod=period)
+            return pd.Series(values, index=series.index, dtype=float)
 
-    spread_points = (latest["ask"] - latest["bid"]) / symbol_info.point
-    if spread_points > config.max_spread_points:
-        logging.info("Spread %.1f exceeds threshold %.1f, skipping signal.", spread_points, config.max_spread_points)
-        return None
+        delta = series.diff()
+        gain = delta.clip(lower=0.0).ewm(alpha=1 / period, adjust=False).mean()
+        loss = (-delta.clip(upper=0.0)).ewm(alpha=1 / period, adjust=False).mean()
+        rs = gain / loss.replace(0.0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
 
-    # EMA crossover logic
-    bullish_cross = previous["ema_fast"] <= previous["ema_slow"] and latest["ema_fast"] > latest["ema_slow"]
-    bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
+    @staticmethod
+    def macd(series: pd.Series, fast: int, slow: int, signal: int) -> pd.DataFrame:
+        if talib is not None:
+            macd, macd_signal, macd_hist = talib.MACD(
+                series.values.astype(float),
+                fastperiod=fast,
+                slowperiod=slow,
+                signalperiod=signal,
+            )
+        else:
+            ema_fast = series.ewm(span=fast, adjust=False).mean()
+            ema_slow = series.ewm(span=slow, adjust=False).mean()
+            macd = ema_fast - ema_slow
+            macd_signal = macd.ewm(span=signal, adjust=False).mean()
+            macd_hist = macd - macd_signal
 
-    atr_points = latest["atr"]
-
-    if bullish_cross and latest["rsi"] < config.rsi_upper:
-        entry = latest["ask"]
-        stop_loss = entry - 1.5 * atr_points
-        take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
-        return TradeSignal(
-            direction="buy",
-            timestamp=latest.name.to_pydatetime(),
-            entry=entry,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            comment="EMA bull cross + RSI filter",
+        return pd.DataFrame(
+            {
+                "macd": macd,
+                "macd_signal": macd_signal,
+                "macd_hist": macd_hist,
+            },
+            index=series.index,
         )
 
-    if bearish_cross and latest["rsi"] > config.rsi_lower:
-        entry = latest["bid"]
-        stop_loss = entry + 1.5 * atr_points
-        take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
-        return TradeSignal(
-            direction="sell",
-            timestamp=latest.name.to_pydatetime(),
-            entry=entry,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            comment="EMA bear cross + RSI filter",
+    @classmethod
+    def enrich(cls, prices: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+        enriched = prices.copy()
+        enriched["ema_fast"] = cls.ema(enriched["close"], config.ema_fast_period)
+        enriched["ema_slow"] = cls.ema(enriched["close"], config.ema_slow_period)
+        enriched["rsi"] = cls.rsi(enriched["close"], config.rsi_period)
+
+        macd_df = cls.macd(
+            enriched["close"],
+            config.macd_fast_period,
+            config.macd_slow_period,
+            config.macd_signal_period,
+        )
+        enriched = enriched.join(macd_df)
+        return enriched.dropna()
+
+
+class SignalEngine:
+    """Generate entry/exit/hold decisions based on indicator state."""
+
+    @staticmethod
+    def evaluate(prices: pd.DataFrame, position: Optional[str], config: StrategyConfig) -> SignalSnapshot:
+        latest = prices.iloc[-1]
+
+        bullish_cross_recent = SignalEngine._recent_cross(
+            prices["ema_fast"],
+            prices["ema_slow"],
+            config.ema_cross_lookback,
+            "up",
+        )
+        bearish_cross_recent = SignalEngine._recent_cross(
+            prices["ema_fast"],
+            prices["ema_slow"],
+            config.ema_cross_lookback,
+            "down",
         )
 
-    return None
+        ema_diff = float(latest["ema_fast"] - latest["ema_slow"])
+        macd_diff = float(latest["macd"] - latest["macd_signal"])
+        macd_cross_up_recent = SignalEngine._recent_cross(
+            prices["macd"],
+            prices["macd_signal"],
+            config.macd_cross_lookback,
+            "up",
+        )
+        macd_cross_down_recent = SignalEngine._recent_cross(
+            prices["macd"],
+            prices["macd_signal"],
+            config.macd_cross_lookback,
+            "down",
+        )
+
+        ema_relation = ">" if latest["ema_fast"] > latest["ema_slow"] else "<" if latest["ema_fast"] < latest["ema_slow"] else "="
+        macd_state = "bullish" if macd_diff > 0 else "bearish" if macd_diff < 0 else "neutral"
+
+        rsi_value = float(latest["rsi"])
+        notes: list[str] = []
+
+        # Exit logic takes precedence when a position is open.
+        if position == "long":
+            if ema_diff <= 0 or bearish_cross_recent or rsi_value >= config.rsi_overbought:
+                if bearish_cross_recent or ema_diff <= 0:
+                    notes.append("EMA crossover reversed")
+                if rsi_value >= config.rsi_overbought:
+                    notes.append("RSI overbought")
+                return SignalSnapshot(
+                    "EXIT LONG",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
+        elif position == "short":
+            if ema_diff >= 0 or bullish_cross_recent or rsi_value <= config.rsi_oversold:
+                if bullish_cross_recent or ema_diff >= 0:
+                    notes.append("EMA crossover reversed")
+                if rsi_value <= config.rsi_oversold:
+                    notes.append("RSI oversold")
+                return SignalSnapshot(
+                    "EXIT SHORT",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
+
+        # Entry logic when flat.
+        if position is None:
+            if (
+                bullish_cross_recent
+                and rsi_value > config.rsi_bull_threshold
+                and macd_cross_up_recent
+                and ema_diff > 0
+                and macd_diff > 0
+            ):
+                notes.extend(["9 EMA above 21 EMA", "RSI bullish", "MACD bull cross"])
+                return SignalSnapshot(
+                    "BUY",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
+            if (
+                bearish_cross_recent
+                and rsi_value < config.rsi_bear_threshold
+                and macd_cross_down_recent
+                and ema_diff < 0
+                and macd_diff < 0
+            ):
+                notes.extend(["9 EMA below 21 EMA", "RSI bearish", "MACD bear cross"])
+                return SignalSnapshot(
+                    "SELL",
+                    ema_relation,
+                    rsi_value,
+                    macd_state,
+                    ema_diff,
+                    macd_diff,
+                    "; ".join(notes),
+                )
+
+        # Otherwise hold position (open positions keep status quo).
+        return SignalSnapshot("HOLD", ema_relation, rsi_value, macd_state, ema_diff, macd_diff)
+
+    @staticmethod
+    def next_position(current: Optional[str], action: str) -> Optional[str]:
+        if action == "BUY":
+            return "long"
+        if action == "SELL":
+            return "short"
+        if action.startswith("EXIT"):
+            return None
+        return current
+
+    @staticmethod
+    def _recent_cross(series_a: pd.Series, series_b: pd.Series, lookback: int, direction: str) -> bool:
+        if lookback <= 0:
+            lookback = 1
+        diff = series_a - series_b
+        prev_diff = diff.shift(1)
+        if direction == "up":
+            crosses = (diff > 0) & (prev_diff <= 0)
+        else:
+            crosses = (diff < 0) & (prev_diff >= 0)
+        return bool(crosses.tail(lookback).any())
 
 
-def format_signal(signal: TradeSignal, config: StrategyConfig) -> str:
-    """İnsan tarafından okunabilir sinyal çıktısı üret."""
+class ScalpingBot:
+    """Co-ordinates connection, data retrieval, and signal output."""
 
-    direction = "AL" if signal.direction == "buy" else "SAT"
-    lines = [
-        f"Sinyal: {direction}",
-        f"Zaman: {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"Giriş fiyatı: {signal.entry:.2f}",
-        f"Stop-loss:   {signal.stop_loss:.2f}",
-        f"Take-profit: {signal.take_profit:.2f}",
-        f"Not: {signal.comment}",
-    ]
-    if config.lot:
-        lines.append(f"Önerilen lot referansı (manuel değerlendirme): {config.lot:.2f}")
-    return "\n".join(lines)
+    def __init__(self, config: StrategyConfig) -> None:
+        self.config = config
+        self.position: Optional[str] = None
 
+    def run(self) -> None:
+        try:
+            self._connect()
+            logging.info("Connected to MetaTrader 5 and subscribed to %s", self.config.symbol)
 
-# ---------------------------------------------------------------------------
-# CLI utilities
-# ---------------------------------------------------------------------------
+            while True:
+                cycle_start = time.time()
+                try:
+                    prices = self._load_prices()
+                    tick = self._latest_tick()
+                    enriched = IndicatorCalculator.enrich(prices, self.config)
+                    if len(enriched) < 2:
+                        raise RuntimeError("Not enough data points after indicator warm-up")
+
+                    signal = SignalEngine.evaluate(enriched, self.position, self.config)
+                    latest_row = enriched.iloc[-1]
+                    latest_price = self._price_from_tick(tick)
+                    tick_epoch = (
+                        getattr(tick, "time_msc", 0) / 1000
+                        if getattr(tick, "time_msc", 0)
+                        else getattr(tick, "time", time.time())
+                    )
+                    tick_time = datetime.fromtimestamp(tick_epoch, tz=timezone.utc)
+
+                    self._print_price(latest_price, latest_row, tick_time)
+
+                    if signal.action != "HOLD":
+                        self._print_signal(signal, latest_price, tick_time)
+
+                    self.position = SignalEngine.next_position(self.position, signal.action)
+                except Exception as error:  # broad on purpose so the loop keeps running
+                    logging.exception("Signal evaluation failed: %s", error)
+                    self._recover_connection()
+
+                self._sleep_until_next_cycle(cycle_start)
+        except KeyboardInterrupt:
+            logging.info("Shutdown requested by user")
+        finally:
+            mt5.shutdown()
+            logging.info("MetaTrader 5 connection closed")
+
+    def _connect(self) -> None:
+        if not mt5.initialize():
+            raise RuntimeError(f"Failed to initialize MetaTrader 5: {mt5.last_error()}")
+        if not mt5.symbol_select(self.config.symbol, True):
+            raise RuntimeError(f"Unable to subscribe to symbol {self.config.symbol}")
+
+    def _recover_connection(self) -> None:
+        logging.info("Attempting to reconnect in %s seconds...", self.config.reconnect_delay)
+        mt5.shutdown()
+        time.sleep(self.config.reconnect_delay)
+        self._connect()
+
+    def _latest_tick(self) -> mt5.Tick:
+        tick = mt5.symbol_info_tick(self.config.symbol)
+        if tick is None:
+            raise RuntimeError(f"Unable to fetch latest tick for {self.config.symbol}: {mt5.last_error()}")
+        return tick
+
+    @staticmethod
+    def _price_from_tick(tick: mt5.Tick) -> float:
+        if getattr(tick, "last", 0.0):
+            return float(tick.last)
+        if getattr(tick, "bid", 0.0) and getattr(tick, "ask", 0.0):
+            return float((tick.bid + tick.ask) / 2)
+        if getattr(tick, "bid", 0.0):
+            return float(tick.bid)
+        if getattr(tick, "ask", 0.0):
+            return float(tick.ask)
+        raise RuntimeError("Tick does not contain price information")
+
+    def _load_prices(self) -> pd.DataFrame:
+        rates = mt5.copy_rates_from_pos(
+            self.config.symbol,
+            self.config.timeframe,
+            0,
+            self.config.history_bars,
+        )
+        if rates is None or len(rates) == 0:
+            raise RuntimeError(f"No rates returned for {self.config.symbol}: {mt5.last_error()}")
+
+        frame = pd.DataFrame(rates)
+        frame["time"] = pd.to_datetime(frame["time"], unit="s")
+        frame.set_index("time", inplace=True)
+        return frame
+
+    def _print_price(self, price: float, latest_row: pd.Series, ts: datetime) -> None:
+        ema_diff = float(latest_row["ema_fast"] - latest_row["ema_slow"])
+        macd_diff = float(latest_row["macd"] - latest_row["macd_signal"])
+        line = (
+            f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] Price: {price:.2f} | "
+            f"EMA: {self.config.ema_fast_period}{'>' if ema_diff > 0 else '<' if ema_diff < 0 else '='}{self.config.ema_slow_period} "
+            f"(diff {ema_diff:.4f}) | RSI: {latest_row['rsi']:.2f} | "
+            f"MACD: {'bullish' if macd_diff > 0 else 'bearish' if macd_diff < 0 else 'neutral'} "
+            f"(diff {macd_diff:.4f})"
+        )
+        print(line, flush=True)
+
+    def _print_signal(self, signal: SignalSnapshot, price: float, ts: datetime) -> None:
+        parts = [
+            f"[{ts.strftime('%Y-%m-%d %H:%M:%S')}] Signal: {signal.action}",
+            f"Price: {price:.2f}",
+            f"EMA: {self.config.ema_fast_period}{signal.ema_relation}{self.config.ema_slow_period} (diff {signal.ema_diff:.4f})",
+            f"RSI: {signal.rsi_value:.2f}",
+            f"MACD: {signal.macd_state} (diff {signal.macd_diff:.4f})",
+        ]
+        if signal.notes:
+            parts.append(f"Notes: {signal.notes}")
+        print(" | ".join(parts), flush=True)
+
+    def _sleep_until_next_cycle(self, cycle_start: float) -> None:
+        elapsed = time.time() - cycle_start
+        sleep_for = max(0.0, self.config.update_interval - elapsed)
+        time.sleep(sleep_for)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MetaTrader5 XAUUSD scalping signal generator")
-    parser.add_argument("--account", type=int, help="Override account login (optional)")
-    parser.add_argument("--password", type=str, help="Override account password (optional)")
-    parser.add_argument("--server", type=str, help="Override trade server name (optional)")
-    parser.add_argument(
-        "--terminal-path",
-        type=str,
-        help="Absolute path to terminal64.exe (auto-launch MT5 if given)",
+    parser = argparse.ArgumentParser(
+        description="Generate manual scalping signals for XAUUSD on a 1-minute chart",
     )
-    parser.add_argument("--lots", type=float, default=0.10, help="Manuel işlemde referans alacağınız lot değeri")
-    parser.add_argument(
-        "--max-spread",
-        type=float,
-        default=30.0,
-        help="Maximum spread in points to accept a trade (default: 30)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug logs",
-    )
+    parser.add_argument("--history", type=int, default=400, help="Number of 1-minute bars to fetch each cycle")
+    parser.add_argument("--interval", type=int, default=5, help="Seconds between signal refreshes (default: 5)")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
 
@@ -267,40 +404,12 @@ def main() -> None:
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    config = StrategyConfig(
-        account=args.account,
-        password=args.password,
-        server=args.server,
-        terminal_path=args.terminal_path,
-        lot=args.lots,
-        max_spread_points=args.max_spread,
-    )
-
-    try:
-        initialize_mt5(config)
-        logging.info("MT5 terminal initialised")
-
-        raw = fetch_rates(config)
-        symbol_info = mt5.symbol_info_tick(config.symbol)
-        if symbol_info is None:
-            raise RuntimeError(f"Symbol tick info for {config.symbol} unavailable")
-
-        raw["bid"] = symbol_info.bid
-        raw["ask"] = symbol_info.ask
-
-        enriched = compute_indicators(raw, config)
-        signal = generate_signal(enriched, config)
-
-        if signal:
-            logging.info("Sinyal bulundu:\n%s", format_signal(signal, config))
-        else:
-            logging.info("No valid signal at %s", datetime.now(timezone.utc))
-
-    finally:
-        shutdown_mt5()
+    config = StrategyConfig(history_bars=args.history, update_interval=args.interval)
+    bot = ScalpingBot(config)
+    bot.run()
 
 
 if __name__ == "__main__":
