@@ -52,6 +52,13 @@ class StrategyConfig:
     rsi_period: int = 14
     rsi_upper: float = 65.0
     rsi_lower: float = 35.0
+    rsi_buy_min: float = 52.0
+    rsi_sell_max: float = 48.0
+    ema_slope_lookback: int = 3
+    volume_ma_period: int = 20
+    min_volume_ratio: float = 0.9
+    min_atr_points: float = 0.05
+    min_trend_atr_ratio: float = 0.05
     reward_risk_ratio: float = 1.5
     account: Optional[int] = None
     password: Optional[str] = None
@@ -145,6 +152,19 @@ def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame
     )
     prices["atr"] = tr.rolling(window=config.atr_period, min_periods=1).mean()
 
+    slope_lookback = max(1, config.ema_slope_lookback)
+    prices["ema_fast_slope"] = prices["ema_fast"] - prices["ema_fast"].shift(slope_lookback)
+    prices["ema_slow_slope"] = prices["ema_slow"] - prices["ema_slow"].shift(slope_lookback)
+    prices["rsi_slope"] = prices["rsi"] - prices["rsi"].shift(slope_lookback)
+
+    if "tick_volume" in prices.columns and config.volume_ma_period > 1:
+        min_periods = max(2, config.volume_ma_period // 2)
+        volume_ma = prices["tick_volume"].rolling(
+            window=config.volume_ma_period,
+            min_periods=min_periods,
+        ).mean()
+        prices["volume_ratio"] = prices["tick_volume"] / volume_ma.replace(0, np.nan)
+
     return prices
 
 
@@ -184,8 +204,43 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
     atr_points = latest["atr"]
+    if pd.isna(atr_points):
+        logging.debug("ATR value is NaN; cannot produce signal.")
+        return None
+    atr_points = max(float(atr_points), config.min_atr_points)
 
-    if bullish_cross and latest["rsi"] < config.rsi_upper:
+    slope_fast = latest.get("ema_fast_slope")
+    slope_slow = latest.get("ema_slow_slope")
+    rsi_slope = latest.get("rsi_slope")
+    volume_ratio = latest.get("volume_ratio")
+
+    bullish_momentum = (
+        (pd.isna(slope_fast) or slope_fast > 0)
+        and (pd.isna(slope_slow) or slope_slow > 0)
+        and (pd.isna(rsi_slope) or rsi_slope >= 0)
+    )
+    bearish_momentum = (
+        (pd.isna(slope_fast) or slope_fast < 0)
+        and (pd.isna(slope_slow) or slope_slow < 0)
+        and (pd.isna(rsi_slope) or rsi_slope <= 0)
+    )
+    volume_ok = pd.isna(volume_ratio) or volume_ratio >= config.min_volume_ratio
+    trend_strength = latest["ema_fast"] - latest["ema_slow"]
+
+    rsi_buy_threshold = max(config.rsi_buy_min, config.rsi_lower)
+    rsi_sell_threshold = min(config.rsi_sell_max, config.rsi_upper)
+    if rsi_sell_threshold >= rsi_buy_threshold:
+        rsi_sell_threshold = max(rsi_buy_threshold - 1.0, 0.0)
+
+    if (
+        bullish_cross
+        and latest["rsi"] >= rsi_buy_threshold
+        and latest["rsi"] <= config.rsi_upper
+        and bullish_momentum
+        and trend_strength >= config.min_trend_atr_ratio * atr_points
+        and latest["close"] >= latest["ema_fast"]
+        and volume_ok
+    ):
         entry = latest["ask"]
         stop_loss = entry - 1.5 * atr_points
         take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
@@ -198,7 +253,14 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
             comment="EMA bull cross + RSI filter",
         )
 
-    if bearish_cross and latest["rsi"] > config.rsi_lower:
+    if (
+        bearish_cross
+        and latest["rsi"] <= rsi_sell_threshold
+        and bearish_momentum
+        and trend_strength <= -config.min_trend_atr_ratio * atr_points
+        and latest["close"] <= latest["ema_fast"]
+        and volume_ok
+    ):
         entry = latest["bid"]
         stop_loss = entry + 1.5 * atr_points
         take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
