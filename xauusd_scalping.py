@@ -28,6 +28,9 @@ class StrategyConfig:
     max_direction_bias: int
     min_atr: float
     micro_ema_period: int
+    min_signal_interval: int
+    min_score: float
+    min_volume_ratio: float
 
 
 @dataclass
@@ -142,8 +145,13 @@ class ScalpingStrategy:
             earlier = recent.iloc[-3]
             if current["tick_volume"] < self.config.min_tick_volume:
                 return Signal(pd.Timestamp.utcnow(), "NONE", np.nan, np.nan, np.nan, np.nan, float(current["rsi"]), float(current["vwap"]), 0.0)
-            if self.last_signal_time is not None and current["time"] == self.last_signal_time:
+            current_time = pd.Timestamp(current["time"])
+            if self.last_signal_time is not None and current_time == self.last_signal_time:
                 return Signal(pd.Timestamp.utcnow(), "NONE", np.nan, np.nan, np.nan, float(current["atr"]), float(current["rsi"]), float(current["vwap"]), 0.0)
+            if self.last_signal_time is not None:
+                elapsed = (current_time - self.last_signal_time).total_seconds()
+                if elapsed < self.config.min_signal_interval:
+                    return Signal(pd.Timestamp.utcnow(), "NONE", np.nan, np.nan, np.nan, float(current["atr"]), float(current["rsi"]), float(current["vwap"]), 0.0)
             rsi_value = float(current["rsi"])
             rsi_delta = rsi_value - float(previous["rsi"])
             rsi_swing = rsi_value - float(earlier["rsi"])
@@ -153,20 +161,33 @@ class ScalpingStrategy:
             micro_slope = float(current["ema_micro"] - previous["ema_micro"])
             volume_mean = recent["tick_volume"].iloc[-10:].mean()
             volume_ratio = current["tick_volume"] / volume_mean if volume_mean else 1.0
+            atr_slope = float(current["atr"] - previous["atr"])
             vwap_threshold = price * self.config.vwap_max_deviation
             long_valid = price >= vwap_value - vwap_threshold
             short_valid = price <= vwap_value + vwap_threshold
             direction = "NONE"
             score = 0.0
-            if trend_state != "DOWN" and rsi_value > 50 and rsi_delta > self.config.rsi_momentum_threshold and rsi_swing > self.config.rsi_momentum_threshold and micro_slope >= 0 and long_valid and volume_ratio >= 0.9 and atr_value >= self.config.min_atr:
+            if volume_ratio < self.config.min_volume_ratio or atr_value < self.config.min_atr:
+                return Signal(pd.Timestamp.utcnow(), "NONE", np.nan, np.nan, np.nan, atr_value, rsi_value, vwap_value, 0.0)
+            if trend_state != "DOWN" and rsi_value > 50 and rsi_delta > self.config.rsi_momentum_threshold and rsi_swing > self.config.rsi_momentum_threshold and micro_slope >= 0 and atr_slope >= 0 and long_valid:
                 direction = "BUY"
-                score = (rsi_delta + rsi_swing) * volume_ratio + max(micro_slope, 0) + max(trend_strength, 0)
-            if trend_state != "UP" and rsi_value < 50 and rsi_delta < -self.config.rsi_momentum_threshold and rsi_swing < -self.config.rsi_momentum_threshold and micro_slope <= 0 and short_valid and volume_ratio >= 0.9 and atr_value >= self.config.min_atr:
-                sell_score = abs(rsi_delta + rsi_swing) * volume_ratio + abs(min(micro_slope, 0)) + abs(min(trend_strength, 0))
+                momentum_score = (rsi_delta + rsi_swing)
+                slope_score = max(micro_slope, 0)
+                trend_score = max(trend_strength, 0)
+                volume_score = max(volume_ratio - 1, 0)
+                atr_score = max(atr_slope, 0)
+                score = momentum_score * 1.2 + slope_score * 4 + trend_score * 0.6 + volume_score * 0.8 + atr_score * 0.5
+            if trend_state != "UP" and rsi_value < 50 and rsi_delta < -self.config.rsi_momentum_threshold and rsi_swing < -self.config.rsi_momentum_threshold and micro_slope <= 0 and atr_slope <= 0 and short_valid:
+                momentum_score = abs(rsi_delta + rsi_swing)
+                slope_score = abs(min(micro_slope, 0))
+                trend_score = abs(min(trend_strength, 0))
+                volume_score = max(volume_ratio - 1, 0)
+                atr_score = abs(min(atr_slope, 0))
+                sell_score = momentum_score * 1.2 + slope_score * 4 + trend_score * 0.6 + volume_score * 0.8 + atr_score * 0.5
                 if sell_score > score:
                     direction = "SELL"
                     score = sell_score
-            if direction == "NONE" or np.isnan(atr_value) or atr_value <= 0:
+            if direction == "NONE" or np.isnan(atr_value) or atr_value <= 0 or score < self.config.min_score:
                 return Signal(pd.Timestamp.utcnow(), "NONE", np.nan, np.nan, np.nan, atr_value, rsi_value, vwap_value, score)
             if not self._direction_allowed(direction):
                 return Signal(pd.Timestamp.utcnow(), "NONE", np.nan, np.nan, np.nan, atr_value, rsi_value, vwap_value, score)
@@ -176,9 +197,9 @@ class ScalpingStrategy:
             else:
                 stop_loss = price + atr_value * self.config.atr_sl_multiplier
                 take_profit = price - atr_value * self.config.atr_tp_multiplier
-            self.last_signal_time = current["time"]
+            self.last_signal_time = current_time
             self.direction_counter[direction] += 1
-            timestamp = current["time"]
+            timestamp = current_time
             return Signal(timestamp, direction, price, stop_loss, take_profit, atr_value, rsi_value, vwap_value, score)
         except Exception as exc:
             print(f"{datetime.now().strftime('%H:%M:%S')} | HATA | Sinyal üretimi başarısız: {exc}")
@@ -205,6 +226,9 @@ def example_usage():
         max_direction_bias=2,
         min_atr=0.05,
         micro_ema_period=8,
+        min_signal_interval=45,
+        min_score=0.6,
+        min_volume_ratio=0.95,
     )
     strategy = ScalpingStrategy(config)
     while True:
