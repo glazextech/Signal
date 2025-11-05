@@ -58,6 +58,11 @@ class StrategyConfig:
     server: Optional[str] = None
     terminal_path: Optional[str] = None
     lot: float = 0.10  # fallback lot kullanıcının manuel değerlendirmesi için
+    momentum_window: int = 3
+    min_momentum: float = 0.05
+    min_signal_strength: float = 1.0
+    min_volume_ratio: float = 1.0
+    stop_atr_multiplier: float = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -183,35 +188,91 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     bullish_cross = previous["ema_fast"] <= previous["ema_slow"] and latest["ema_fast"] > latest["ema_slow"]
     bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
-    atr_points = latest["atr"]
+    atr_points = float(latest["atr"])
+    if np.isnan(atr_points) or atr_points <= 0:
+        logging.debug("ATR invalid or zero (%.4f), skipping signal", atr_points)
+        return None
 
-    if bullish_cross and latest["rsi"] < config.rsi_upper:
-        entry = latest["ask"]
-        stop_loss = entry - 1.5 * atr_points
-        take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
-        return TradeSignal(
-            direction="buy",
-            timestamp=latest.name.to_pydatetime(),
-            entry=entry,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            comment="EMA bull cross + RSI filter",
+    volume_ratio = 1.0
+    if "tick_volume" in prices.columns:
+        recent_volume = prices["tick_volume"].iloc[-20:]
+        avg_volume = recent_volume.mean()
+        if avg_volume and avg_volume > 0:
+            volume_ratio = latest["tick_volume"] / avg_volume
+
+    if volume_ratio < config.min_volume_ratio:
+        logging.debug(
+            "Volume ratio %.2f below threshold %.2f, skipping signal.",
+            volume_ratio,
+            config.min_volume_ratio,
         )
+        return None
 
-    if bearish_cross and latest["rsi"] > config.rsi_lower:
+    momentum_window = min(config.momentum_window, len(prices) - 2)
+    if momentum_window <= 0:
+        logging.debug("Not enough data for momentum window=%s", config.momentum_window)
+        return None
+
+    reference_close = prices["close"].iloc[-(momentum_window + 1)]
+    momentum = (latest["close"] - reference_close) / atr_points if atr_points else 0.0
+
+    bullish_stack = latest["close"] > latest["ema_fast"] > latest["ema_slow"]
+    bearish_stack = latest["close"] < latest["ema_fast"] < latest["ema_slow"]
+    rsi_oversold = latest["rsi"] <= config.rsi_lower
+    rsi_overbought = latest["rsi"] >= config.rsi_upper
+
+    min_momentum = max(config.min_momentum, 1e-6)
+    ema_gap_buy = max(0.0, (latest["ema_fast"] - latest["ema_slow"]) / atr_points)
+    ema_gap_sell = max(0.0, (latest["ema_slow"] - latest["ema_fast"]) / atr_points)
+
+    momentum_buy_component = max(0.0, momentum) / min_momentum
+    momentum_sell_component = max(0.0, -momentum) / min_momentum
+    rsi_buy_component = max(0.0, (config.rsi_lower - latest["rsi"])) / max(1.0, config.rsi_lower)
+    rsi_sell_component = max(0.0, (latest["rsi"] - config.rsi_upper)) / max(1.0, 100 - config.rsi_upper)
+
+    bullish_strength = 0.0
+    if bullish_cross and bullish_stack and rsi_oversold:
+        bullish_strength = ema_gap_buy + momentum_buy_component + rsi_buy_component
+
+    bearish_strength = 0.0
+    if bearish_cross and bearish_stack and rsi_overbought:
+        bearish_strength = ema_gap_sell + momentum_sell_component + rsi_sell_component
+
+    selected_signal: Optional[TradeSignal] = None
+    selected_strength = 0.0
+
+    if bearish_strength >= config.min_signal_strength and momentum <= -config.min_momentum:
         entry = latest["bid"]
-        stop_loss = entry + 1.5 * atr_points
+        stop_loss = entry + config.stop_atr_multiplier * atr_points
         take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
-        return TradeSignal(
+        selected_signal = TradeSignal(
             direction="sell",
             timestamp=latest.name.to_pydatetime(),
             entry=entry,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            comment="EMA bear cross + RSI filter",
+            comment=f"EMA bear cross + RSI overbought | strength={bearish_strength:.2f} | vol={volume_ratio:.2f}",
+        )
+        selected_strength = bearish_strength
+
+    if (
+        bullish_strength >= config.min_signal_strength
+        and momentum >= config.min_momentum
+        and bullish_strength > selected_strength
+    ):
+        entry = latest["ask"]
+        stop_loss = entry - config.stop_atr_multiplier * atr_points
+        take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
+        selected_signal = TradeSignal(
+            direction="buy",
+            timestamp=latest.name.to_pydatetime(),
+            entry=entry,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            comment=f"EMA bull cross + RSI oversold | strength={bullish_strength:.2f} | vol={volume_ratio:.2f}",
         )
 
-    return None
+    return selected_signal
 
 
 def format_signal(signal: TradeSignal, config: StrategyConfig) -> str:
