@@ -27,7 +27,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import MetaTrader5 as mt5  # type: ignore
 import numpy as np
@@ -58,6 +58,26 @@ class StrategyConfig:
     server: Optional[str] = None
     terminal_path: Optional[str] = None
     lot: float = 0.10  # fallback lot kullanıcının manuel değerlendirmesi için
+
+    def __post_init__(self) -> None:
+        if self.ema_fast_period <= 0 or self.ema_slow_period <= 0:
+            raise ValueError("EMA dönemleri pozitif olmalıdır.")
+        if self.ema_fast_period >= self.ema_slow_period:
+            raise ValueError("ema_fast_period, ema_slow_period değerinden küçük olmalıdır.")
+        if self.atr_period <= 0:
+            raise ValueError("ATR periyodu pozitif olmalıdır.")
+        if self.rsi_period <= 0:
+            raise ValueError("RSI periyodu pozitif olmalıdır.")
+        if self.reward_risk_ratio <= 0:
+            raise ValueError("reward_risk_ratio pozitif olmalıdır.")
+        min_required_lookback = max(self.atr_period, self.ema_slow_period) + 2
+        if self.lookback < min_required_lookback:
+            raise ValueError(
+                "lookback değeri çok küçük. ATR ve EMA hesaplamaları için en az "
+                f"{min_required_lookback} bar veri gereklidir."
+            )
+        if self.max_spread_points <= 0:
+            raise ValueError("max_spread_points pozitif olmalıdır.")
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +111,24 @@ def initialize_mt5(config: StrategyConfig) -> None:
     else:
         logging.info("Using existing MT5 terminal session (no credentials supplied)")
 
+    if not mt5.symbol_select(config.symbol, True):
+        last_error = mt5.last_error()
+        mt5.shutdown()
+        raise RuntimeError(
+            f"MT5, {config.symbol} sembolünü seçemedi. Hata: {last_error}"
+        )
+
+    symbol_info = mt5.symbol_info(config.symbol)
+    if symbol_info is None:
+        mt5.shutdown()
+        raise RuntimeError(f"{config.symbol} sembol bilgisi alınamadı.")
+
+    if symbol_info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+        logging.warning(
+            "%s sembolü işlem için pasif görünüyor (trade_mode=DISABLED). Broker ayarlarını kontrol edin.",
+            config.symbol,
+        )
+
 
 def shutdown_mt5() -> None:
     """Gracefully close MT5 API connection."""
@@ -110,10 +148,16 @@ def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
 
     if rates is None or len(rates) == 0:
         raise RuntimeError(f"Failed to fetch rates for {config.symbol}: {mt5.last_error()}")
+    if len(rates) < 2:
+        raise RuntimeError(
+            f"{config.symbol} için yeterli mum alınamadı (gereken >=2, alınan {len(rates)})."
+        )
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df.set_index("time", inplace=True)
+    df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
     return df
 
 
@@ -125,25 +169,36 @@ def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
 def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     """Append EMA, RSI, ATR indicators to the price DataFrame."""
 
-    prices = df.copy()
+    if df.empty:
+        raise ValueError("Indicator hesaplaması için boş DataFrame alındı.")
+
+    required_columns = {"open", "high", "low", "close"}
+    missing_columns = required_columns.difference(df.columns)
+    if missing_columns:
+        raise KeyError(f"Eksik kolon(lar): {', '.join(sorted(missing_columns))}")
+
+    prices = df.sort_index().copy()
 
     prices["ema_fast"] = prices["close"].ewm(span=config.ema_fast_period, adjust=False).mean()
     prices["ema_slow"] = prices["close"].ewm(span=config.ema_slow_period, adjust=False).mean()
 
     delta = prices["close"].diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    prices["rsi"] = 100 - (100 / (1 + rs))
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / config.rsi_period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / config.rsi_period, adjust=False).mean().replace(0, np.nan)
+    rs = avg_gain / avg_loss
+    prices["rsi"] = (100 - (100 / (1 + rs))).clip(0, 100)
+    prices["rsi"].fillna(method="bfill", inplace=True)
 
     tr = np.maximum(
         prices["high"] - prices["low"],
         np.maximum(
-            prices["high"] - prices["close"].shift(1),
-            prices["close"].shift(1) - prices["low"],
+            (prices["high"] - prices["close"].shift(1)).abs(),
+            (prices["close"].shift(1) - prices["low"]).abs(),
         ),
     )
-    prices["atr"] = tr.rolling(window=config.atr_period, min_periods=1).mean()
+    prices["atr"] = tr.ewm(alpha=1 / config.atr_period, adjust=False).mean()
 
     return prices
 
@@ -153,9 +208,12 @@ def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame
 # ---------------------------------------------------------------------------
 
 
+TradeDirection = Literal["buy", "sell"]
+
+
 @dataclass
 class TradeSignal:
-    direction: str
+    direction: TradeDirection
     timestamp: datetime
     entry: float
     stop_loss: float
@@ -166,12 +224,35 @@ class TradeSignal:
 def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[TradeSignal]:
     """Generate a trade signal based on EMA crossover + RSI filter + volatility."""
 
+    if prices.shape[0] < 2:
+        logging.debug("Sinyal üretmek için yeterli mum yok (rows=%s)", prices.shape[0])
+        return None
+
+    required_columns = {"ema_fast", "ema_slow", "rsi", "atr", "bid", "ask"}
+    missing_columns = required_columns.difference(prices.columns)
+    if missing_columns:
+        logging.error("Sinyal için gerekli kolonlar eksik: %s", ", ".join(sorted(missing_columns)))
+        return None
+
+    prices = prices.sort_index()
     latest = prices.iloc[-1]
     previous = prices.iloc[-2]
 
     symbol_info = mt5.symbol_info(config.symbol)
     if symbol_info is None:
         logging.warning("Symbol info for %s unavailable; cannot compute signal", config.symbol)
+        return None
+
+    if symbol_info.point == 0:
+        logging.warning("%s sembolü için point değeri 0 döndü.", config.symbol)
+        return None
+
+    if any(val <= 0 for val in (latest["bid"], latest["ask"])) or latest["ask"] < latest["bid"]:
+        logging.debug(
+            "Bid/ask değerleri geçersiz görünüyor (bid=%s, ask=%s)",
+            latest["bid"],
+            latest["ask"],
+        )
         return None
 
     spread_points = (latest["ask"] - latest["bid"]) / symbol_info.point
@@ -184,6 +265,13 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
     atr_points = latest["atr"]
+    if not np.isfinite(atr_points) or atr_points <= 0:
+        logging.debug("ATR değeri geçersiz: %s", atr_points)
+        return None
+
+    if not np.isfinite(latest["rsi"]):
+        logging.debug("RSI değeri geçersiz: %s", latest["rsi"])
+        return None
 
     if bullish_cross and latest["rsi"] < config.rsi_upper:
         entry = latest["ask"]
@@ -288,6 +376,11 @@ def main() -> None:
         if symbol_info is None:
             raise RuntimeError(f"Symbol tick info for {config.symbol} unavailable")
 
+        if symbol_info.bid <= 0 or symbol_info.ask <= 0:
+            raise RuntimeError(
+                f"{config.symbol} için geçersiz tick verisi alındı (bid={symbol_info.bid}, ask={symbol_info.ask})."
+            )
+
         raw["bid"] = symbol_info.bid
         raw["ask"] = symbol_info.ask
 
@@ -299,6 +392,9 @@ def main() -> None:
         else:
             logging.info("No valid signal at %s", datetime.now(timezone.utc))
 
+    except Exception as exc:
+        logging.exception("Strateji çalıştırılırken hata oluştu: %s", exc)
+        raise
     finally:
         shutdown_mt5()
 
