@@ -32,8 +32,8 @@ rewardRisk      = input.float(1.6, "Reward to Risk Ratio", step=0.1)
 
 useVolFilter    = input.bool(true, "Use Volatility Filter")
 useSession      = input.bool(true, "Use Session Filter")
-sessionInput    = input.session("0100-2300", "Active Trading Session (Exchange Time)")
-sessionTz       = input.string("Etc/UTC", "Session Timezone")
+sessionInput    = input.session("0100-2300", "Active Trading Session")
+sessionTz       = input.timezone("Etc/UTC", "Session Timezone")
 
 showStops       = input.bool(true, "Plot Active Stops/Targets")
 showLabels      = input.bool(true, "Show Entry/Exit Labels")
@@ -54,7 +54,7 @@ atrValue        = ta.atr(atrLen)
 atrAverage      = ta.sma(atrValue, atrSmooth)
 
 volatilityOk    = not useVolFilter or atrValue > atrAverage
-sessionOk       = not useSession or session.ismarket(sessionInput, sessionTz)
+sessionOk       = not useSession or not na(time(timeframe.period, sessionInput, sessionTz))
 
 trendUp         = close > emaSlow and close > htfEma and superTrendDir == 1
 trendDown       = close < emaSlow and close < htfEma and superTrendDir == -1
