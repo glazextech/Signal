@@ -27,11 +27,15 @@ class StrategyConfig:
     ema_slow_period: int = 55
     rsi_period: int = 14
     atr_period: int = 14
-    atr_multiplier: float = 0.35
-    min_tick_volume: int = 50
-    trend_lookback: int = 600
-    entry_lookback: int = 400
+    atr_multiplier: float = 0.28
+    min_tick_volume: int = 20
+    trend_lookback: int = 450
+    entry_lookback: int = 250
     poll_interval: float = 1.0
+    rsi_buy_threshold: float = 52.0
+    rsi_sell_threshold: float = 48.0
+    vwap_tolerance: float = 0.15
+    ema_slope_lookback: int = 3
 
 
 @dataclass
@@ -239,6 +243,7 @@ class ScalpingStrategy:
         df["rsi"] = compute_rsi(df["close"], max(7, int(self.config.rsi_period / 2)))
         df["atr"] = compute_atr(df, max(10, int(self.config.atr_period / 2)))
         df["vwap"] = compute_vwap(df)
+        df["ema_fast_slope"] = df["ema_fast"].diff(self.config.ema_slope_lookback)
         return df.dropna()
 
     def generate_signal(self) -> Signal:
@@ -258,20 +263,27 @@ class ScalpingStrategy:
         take_profit = None
         if entry_row["tick_volume"] < self.config.min_tick_volume:
             return Signal(self.config.symbol, direction, entry_row.name.to_pydatetime(), price)
+        vwap = float(entry_row["vwap"])
+        slope = float(entry_row["ema_fast_slope"])
+        slope_ok = slope > 0
+        tolerance = self.config.vwap_tolerance
+
         if (
             trend_bias == "BULLISH"
-            and entry_row["ema_fast"] > entry_row["ema_slow"]
-            and entry_row["rsi"] > 55
-            and price > float(entry_row["vwap"])
+            and entry_row["ema_fast"] >= entry_row["ema_slow"]
+            and entry_row["rsi"] >= self.config.rsi_buy_threshold
+            and price >= vwap - tolerance
+            and slope_ok
         ):
             direction = "BUY"
             stop_loss = price - self.config.atr_multiplier * atr_value
             take_profit = price + self.config.atr_multiplier * 1.5 * atr_value
         elif (
             trend_bias == "BEARISH"
-            and entry_row["ema_fast"] < entry_row["ema_slow"]
-            and entry_row["rsi"] < 45
-            and price < float(entry_row["vwap"])
+            and entry_row["ema_fast"] <= entry_row["ema_slow"]
+            and entry_row["rsi"] <= self.config.rsi_sell_threshold
+            and price <= vwap + tolerance
+            and slope < 0
         ):
             direction = "SELL"
             stop_loss = price + self.config.atr_multiplier * atr_value
