@@ -1,24 +1,9 @@
-"""Fixed-time trade signal generator leveraging MetaTrader 5 market data.
+"""Fixed-time trading signal generator built on MetaTrader 5 market data.
 
-This module connects to the locally installed MetaTrader 5 terminal, streams
-recent candles and live ticks for a chosen symbol, performs comprehensive
-technical analysis, and emits auditable buy/sell recommendations. The script
-never places trades automatically: it prints an OCO-style (one-cancels-other)
-plan comprising entry, stop-loss, and target levels so a human trader can act
-manually.
-
-Highlights
-~~~~~~~~~~
-* Native MetaTrader 5 data feed (no web scraping) with automatic terminal
-  initialisation and optional credential-based login.
-* Indicator suite covering EMAs, RSI, MACD, momentum, rolling volatility, and
-  ATR, implemented with :mod:`pandas`/:mod:`numpy` for determinism.
-* Probabilistic signal scoring that converts indicator confluence into a
-  calibrated logistic probability for long/short candidates.
-* Risk management based on ATR-derived stop distance, configurable risk per
-  trade, and maximum stake limits.
-* Dynamic configuration reload from JSON/YAML so parameters can be tuned at
-  runtime without restarting the script.
+This script connects to a locally installed MetaTrader 5 terminal, analyses
+recent price action, and emits high-confidence CALL/PUT recommendations for
+60-second fixed-time contracts. Signals are informational only; no trades are
+executed automatically.
 """
 
 from __future__ import annotations
@@ -30,8 +15,9 @@ import math
 import signal
 import time
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import MetaTrader5 as mt5  # type: ignore
 import numpy as np
@@ -48,26 +34,17 @@ TIMEFRAME_ALIASES = {
     "m1": mt5.TIMEFRAME_M1,
     "60s": mt5.TIMEFRAME_M1,
     "5m": mt5.TIMEFRAME_M5,
-    "m5": mt5.TIMEFRAME_M5,
     "15m": mt5.TIMEFRAME_M15,
-    "m15": mt5.TIMEFRAME_M15,
     "30m": mt5.TIMEFRAME_M30,
-    "m30": mt5.TIMEFRAME_M30,
     "1h": mt5.TIMEFRAME_H1,
     "h1": mt5.TIMEFRAME_H1,
-    "4h": mt5.TIMEFRAME_H4,
-    "h4": mt5.TIMEFRAME_H4,
-    "1d": mt5.TIMEFRAME_D1,
-    "d1": mt5.TIMEFRAME_D1,
 }
 
 
 def resolve_timeframe(label: str) -> int:
-    """Convert human-readable timeframe (e.g. ``"1m"``) to MT5 enum."""
-
-    normalised = label.strip().lower().replace(" ", "")
+    normalised = label.strip().lower()
     if normalised not in TIMEFRAME_ALIASES:
-        raise ValueError(f"Unsupported timeframe '{label}'. Supported keys: {sorted(TIMEFRAME_ALIASES)}")
+        raise ValueError(f"Unsupported timeframe '{label}'. Supported values: {sorted(TIMEFRAME_ALIASES)}")
     return TIMEFRAME_ALIASES[normalised]
 
 
@@ -78,50 +55,58 @@ def resolve_timeframe(label: str) -> int:
 
 @dataclass(slots=True)
 class IndicatorSettings:
-    """Indicator lookback configuration."""
-
-    ema_fast_period: int = 9
-    ema_slow_period: int = 21
-    ema_trend_period: int = 55
+    ema_fast: int = 5
+    ema_mid: int = 13
+    ema_slow: int = 34
     rsi_period: int = 14
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
-    momentum_period: int = 10
+    momentum_period_short: int = 3
+    momentum_period_long: int = 8
     volatility_period: int = 20
     atr_period: int = 14
+    stoch_k_period: int = 8
+    stoch_d_period: int = 3
+    stoch_smoothing: int = 3
+    bollinger_period: int = 20
+    bollinger_std: float = 2.0
 
 
 @dataclass(slots=True)
 class RiskSettings:
-    """Risk management configuration."""
-
     account_balance: float = 1000.0
-    risk_per_trade: float = 0.01
+    risk_per_trade: float = 0.02
     max_trade_size: float = 100.0
     min_probability: float = 0.55
-    atr_stop_multiplier: float = 1.8
-    atr_target_multiplier: float = 2.7
-    reward_risk_ratio: float = 1.5
+    max_consecutive_same_direction: int = 2
+
+
+@dataclass(slots=True)
+class TradeSettings:
+    expiry_seconds: int = 60
+    entry_window_seconds: int = 15
+    min_confidence_edge: float = 0.07
+    min_momentum: float = 0.0001
+    max_spread_points: float = 25.0
+    entry_buffer_points: float = 3.0
 
 
 @dataclass(slots=True)
 class StrategyConfig:
-    """Top-level strategy configuration."""
-
     symbol: str = "EURUSD"
     timeframe: str = "1m"
     history_candles: int = 600
     warmup_candles: int = 150
     loop_seconds: int = 30
-    max_spread_points: float = 25.0
     account: Optional[int] = None
     password: Optional[str] = None
     server: Optional[str] = None
-    terminal_path: Optional[str] = None
+    terminal_path: Optional[Path] = None
     config_path: Optional[Path] = None
     indicators: IndicatorSettings = field(default_factory=IndicatorSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
+    trade: TradeSettings = field(default_factory=TradeSettings)
 
     @property
     def timeframe_id(self) -> int:
@@ -129,42 +114,35 @@ class StrategyConfig:
 
     @staticmethod
     def from_mapping(mapping: Dict[str, Any]) -> "StrategyConfig":
-        """Hydrate a :class:`StrategyConfig` from a nested mapping."""
-
-        def filter_kwargs(cls: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        def filter_fields(cls: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
             allowed = set(cls.__dataclass_fields__.keys())  # type: ignore[attr-defined]
             return {k: v for k, v in payload.items() if k in allowed}
 
-        indicator_payload = mapping.get("indicators", {}) or {}
-        risk_payload = mapping.get("risk", {}) or {}
+        indicators = IndicatorSettings(**filter_fields(IndicatorSettings, mapping.get("indicators", {}) or {}))
+        risk = RiskSettings(**filter_fields(RiskSettings, mapping.get("risk", {}) or {}))
+        trade = TradeSettings(**filter_fields(TradeSettings, mapping.get("trade", {}) or {}))
 
-        indicators = IndicatorSettings(**filter_kwargs(IndicatorSettings, indicator_payload))
-        risk = RiskSettings(**filter_kwargs(RiskSettings, risk_payload))
-
-        core_allowed = set(StrategyConfig.__dataclass_fields__.keys()) - {"indicators", "risk"}
+        core_allowed = set(StrategyConfig.__dataclass_fields__.keys()) - {"indicators", "risk", "trade"}
         core = {k: v for k, v in mapping.items() if k in core_allowed}
         if "config_path" in core and core["config_path"] is not None:
             core["config_path"] = Path(core["config_path"])
-        return StrategyConfig(indicators=indicators, risk=risk, **core)  # type: ignore[arg-type]
+        return StrategyConfig(indicators=indicators, risk=risk, trade=trade, **core)  # type: ignore[arg-type]
 
 
 class ConfigManager:
-    """Load and optionally hot-reload strategy configuration."""
+    """Load and hot-reload configuration from disk."""
 
     def __init__(self, initial: StrategyConfig) -> None:
         self._config = initial
         self._config_mtime: Optional[float] = None
         if initial.config_path:
-            mtime = self._get_mtime(initial.config_path)
+            mtime = self._stat(initial.config_path)
             if mtime is not None:
-                overrides = self._load_file(initial.config_path)
+                overrides = self._load(initial.config_path)
                 self._config = StrategyConfig.from_mapping({**asdict(initial), **overrides})
                 self._config_mtime = mtime
             else:
-                logging.warning(
-                    "Config file %s not found at startup; waiting for creation",
-                    initial.config_path,
-                )
+                logging.warning("Config file %s not found; watching for creation", initial.config_path)
 
     @property
     def config(self) -> StrategyConfig:
@@ -174,17 +152,17 @@ class ConfigManager:
         path = self._config.config_path
         if not path:
             return self._config
-        mtime = self._get_mtime(path)
+        mtime = self._stat(path)
         if mtime is None or mtime == self._config_mtime:
             return self._config
         logging.info("Reloading strategy configuration from %s", path)
-        overrides = self._load_file(path)
+        overrides = self._load(path)
         self._config = StrategyConfig.from_mapping({**asdict(self._config), **overrides})
         self._config_mtime = mtime
         return self._config
 
     @staticmethod
-    def _load_file(path: Path) -> Dict[str, Any]:
+    def _load(path: Path) -> Dict[str, Any]:
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
         if path.suffix.lower() in {".yaml", ".yml"}:
@@ -198,7 +176,7 @@ class ConfigManager:
             return json.load(handle)
 
     @staticmethod
-    def _get_mtime(path: Path) -> Optional[float]:
+    def _stat(path: Path) -> Optional[float]:
         try:
             return path.stat().st_mtime
         except FileNotFoundError:
@@ -206,19 +184,16 @@ class ConfigManager:
 
 
 # ---------------------------------------------------------------------------
-# MetaTrader 5 initialisation helpers
+# MetaTrader 5 helpers
 # ---------------------------------------------------------------------------
 
 
 def initialize_mt5(config: StrategyConfig) -> None:
-    """Initialise the MetaTrader 5 terminal and authenticate if required."""
-
     init_kwargs: Dict[str, Any] = {}
     if config.terminal_path:
         init_kwargs["path"] = str(config.terminal_path)
     if not mt5.initialize(**init_kwargs):
-        error = mt5.last_error()
-        raise RuntimeError(f"MT5 initialize() failed: {error}")
+        raise RuntimeError(f"MT5 initialize() failed: {mt5.last_error()}")
 
     if config.account and config.password and config.server:
         if not mt5.login(config.account, password=config.password, server=config.server):
@@ -227,7 +202,7 @@ def initialize_mt5(config: StrategyConfig) -> None:
             raise RuntimeError(f"MT5 login failed for account {config.account}: {last_error}")
         logging.info("Logged in to MT5 account %s", config.account)
     else:
-        logging.info("Using active MT5 terminal session (no credentials supplied)")
+        logging.info("Using existing MT5 session; ensure terminal is authorised")
 
     if not mt5.symbol_select(config.symbol, True):
         mt5.shutdown()
@@ -235,8 +210,6 @@ def initialize_mt5(config: StrategyConfig) -> None:
 
 
 def shutdown_mt5() -> None:
-    """Gracefully terminate the MT5 connection."""
-
     mt5.shutdown()
 
 
@@ -246,8 +219,6 @@ def shutdown_mt5() -> None:
 
 
 class MT5DataClient:
-    """Fetch candles and ticks from MetaTrader 5."""
-
     def __init__(self, config: StrategyConfig) -> None:
         self._config = config
         self._timeframe = config.timeframe_id
@@ -264,21 +235,13 @@ class MT5DataClient:
         if rates is None or len(rates) == 0:
             raise RuntimeError(f"No rates returned for {self._config.symbol}: {mt5.last_error()}")
 
-        frame = pd.DataFrame(rates)
-        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
-        frame = frame.set_index("time").rename(
-            columns={
-                "open": "open",
-                "high": "high",
-                "low": "low",
-                "close": "close",
-                "tick_volume": "volume",
-            }
-        )
-        frame = frame[["open", "high", "low", "close", "volume"]]
-        return frame
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df.set_index("time")
+        df = df.rename(columns={"tick_volume": "volume"})
+        return df[["open", "high", "low", "close", "volume"]]
 
-    def get_tick_and_info(self) -> tuple[Any, Any]:
+    def get_tick_and_info(self) -> Tuple[Any, Any]:
         symbol_info = mt5.symbol_info(self._config.symbol)
         if symbol_info is None:
             raise RuntimeError(f"Symbol info unavailable for {self._config.symbol}")
@@ -294,24 +257,24 @@ class MT5DataClient:
 
 
 class IndicatorEngine:
-    """Compute technical indicators needed for the strategy."""
-
     def __init__(self, settings: IndicatorSettings) -> None:
         self._settings = settings
 
     def enrich(self, candles: pd.DataFrame) -> pd.DataFrame:
         data = candles.copy()
-        closes = data["close"]
         settings = self._settings
 
-        data["ema_fast"] = closes.ewm(span=settings.ema_fast_period, adjust=False).mean()
-        data["ema_slow"] = closes.ewm(span=settings.ema_slow_period, adjust=False).mean()
-        data["ema_trend"] = closes.ewm(span=settings.ema_trend_period, adjust=False).mean()
+        closes = data["close"]
+        data["ema_fast"] = closes.ewm(span=settings.ema_fast, adjust=False).mean()
+        data["ema_mid"] = closes.ewm(span=settings.ema_mid, adjust=False).mean()
+        data["ema_slow"] = closes.ewm(span=settings.ema_slow, adjust=False).mean()
+        data["ema_fast_slope"] = data["ema_fast"].diff()
+        data["ema_mid_slope"] = data["ema_mid"].diff()
 
         delta = closes.diff()
         gain = delta.clip(lower=0).ewm(alpha=1 / settings.rsi_period, adjust=False).mean()
         loss = (-delta.clip(upper=0)).ewm(alpha=1 / settings.rsi_period, adjust=False).mean()
-        rs = gain / loss.replace(to_replace=0, value=np.nan)
+        rs = gain / loss.replace(0, np.nan)
         data["rsi"] = 100 - (100 / (1 + rs))
 
         ema_fast = closes.ewm(span=settings.macd_fast, adjust=False).mean()
@@ -320,12 +283,11 @@ class IndicatorEngine:
         data["macd_signal"] = data["macd"].ewm(span=settings.macd_signal, adjust=False).mean()
         data["macd_hist"] = data["macd"] - data["macd_signal"]
 
-        data["momentum"] = closes.pct_change(periods=settings.momentum_period)
+        data["momentum_short"] = closes.pct_change(settings.momentum_period_short)
+        data["momentum_long"] = closes.pct_change(settings.momentum_period_long)
 
         returns = closes.pct_change()
-        data["volatility"] = returns.rolling(window=settings.volatility_period).std() * math.sqrt(
-            settings.volatility_period
-        )
+        data["volatility"] = returns.rolling(window=settings.volatility_period).std()
 
         high_low = data["high"] - data["low"]
         high_close = (data["high"] - data["close"].shift()).abs()
@@ -333,63 +295,72 @@ class IndicatorEngine:
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         data["atr"] = tr.rolling(window=settings.atr_period, min_periods=1).mean()
 
+        highest_high = data["high"].rolling(window=settings.stoch_k_period).max()
+        lowest_low = data["low"].rolling(window=settings.stoch_k_period).min()
+        stoch_raw = ((closes - lowest_low) / (highest_high - lowest_low)).replace([np.inf, -np.inf], np.nan)
+        data["stoch_k"] = stoch_raw.rolling(window=settings.stoch_smoothing).mean() * 100
+        data["stoch_d"] = data["stoch_k"].rolling(window=settings.stoch_d_period).mean()
+
+        bollinger_mid = closes.rolling(window=settings.bollinger_period).mean()
+        bollinger_std = closes.rolling(window=settings.bollinger_period).std(ddof=0)
+        data["boll_mid"] = bollinger_mid
+        data["boll_upper"] = bollinger_mid + settings.bollinger_std * bollinger_std
+        data["boll_lower"] = bollinger_mid - settings.bollinger_std * bollinger_std
+
+        body = data["close"] - data["open"]
+        range_ = (data["high"] - data["low"]).replace(0, np.nan)
+        data["body_relative"] = body / range_
+
         data.dropna(inplace=True)
         return data
 
 
 # ---------------------------------------------------------------------------
-# Risk management
+# Signal evaluation components
 # ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
 class SignalCandidate:
-    direction: str
-    entry: float
-    stop_loss: float
-    take_profit: float
-    probability: float
-    score: float
-    timestamp: pd.Timestamp
-    notes: str
+    direction: str  # "call" or "put"
+    confidence: float
+    entry_price: float
+    reference_price: float
     spread_points: float
+    expiry_time: datetime
+    entry_deadline: datetime
+    invalidation_price: float
+    momentum_short: float
+    notes: List[str]
+    timestamp: pd.Timestamp
 
 
 class RiskManager:
-    """Convert signals into actionable trade plans respecting risk settings."""
-
     def __init__(self, settings: RiskSettings) -> None:
         self._settings = settings
+        self._last_direction: Optional[str] = None
+        self._same_direction_count = 0
 
-    def position_size(self, entry: float, stop_loss: float) -> float:
-        risk_settings = self._settings
-        risk_amount = risk_settings.account_balance * risk_settings.risk_per_trade
-        stop_distance = max(abs(entry - stop_loss), 1e-8)
-        if not math.isfinite(stop_distance):
-            return 0.0
-        raw_size = risk_amount / stop_distance
-        recommended = min(raw_size, risk_settings.max_trade_size)
-        logging.debug(
-            "Position sizing: risk=%s stop_distance=%s raw_size=%s recommended=%s",
-            risk_amount,
-            stop_distance,
-            raw_size,
-            recommended,
-        )
-        return max(recommended, 0.0)
+    def stake_size(self, confidence: float) -> float:
+        base = self._settings.account_balance * self._settings.risk_per_trade
+        scaled = max(0.5, min(confidence, 0.95))
+        weight = (scaled - 0.5) / 0.45
+        stake = base * (0.75 + 0.5 * weight)
+        return float(min(stake, self._settings.max_trade_size))
 
-    def is_probability_acceptable(self, probability: float) -> bool:
-        return probability >= self._settings.min_probability
+    def accept_direction(self, direction: str) -> bool:
+        if direction != self._last_direction:
+            self._last_direction = direction
+            self._same_direction_count = 1
+            return True
+        self._same_direction_count += 1
+        return self._same_direction_count <= self._settings.max_consecutive_same_direction
 
-
-# ---------------------------------------------------------------------------
-# Signal evaluation
-# ---------------------------------------------------------------------------
+    def is_probability_acceptable(self, confidence: float) -> bool:
+        return confidence >= self._settings.min_probability
 
 
 class SignalEngine:
-    """Generate probabilistic trade candidates from enriched data."""
-
     def __init__(self, config: StrategyConfig) -> None:
         self._config = config
 
@@ -407,103 +378,144 @@ class SignalEngine:
         previous = data.iloc[-2] if len(data) > 1 else latest
 
         features = self._collect_features(latest, previous)
-        prob_long, prob_short = self._score_probabilities(features)
-        prob_gap = abs(prob_long - prob_short)
+        prob_call, prob_put = self._score_probabilities(features)
+        confidence = max(prob_call, prob_put)
+        edge = confidence - 0.5
 
-        logging.debug(
-            "Features: %s prob_long=%.3f prob_short=%.3f",
-            features,
-            prob_long,
-            prob_short,
-        )
+        logging.debug("Features: %s | prob_call=%.3f prob_put=%.3f", features, prob_call, prob_put)
 
-        min_prob = self._config.risk.min_probability
-        if prob_long < min_prob and prob_short < min_prob:
-            if prob_gap < 0.05:
-                return None
-            # allow compelling relative edge even if absolute probability is slightly low
-            boost = min_prob * 0.95
-            prob_long = max(prob_long, boost)
-            prob_short = max(prob_short, boost)
+        trade = self._config.trade
+        if edge < trade.min_confidence_edge:
+            return None
 
-        direction = "buy" if prob_long >= prob_short else "sell"
-        probability = max(prob_long, prob_short)
-        atr = float(latest["atr"])
-        close_price = float(latest["close"])
+        if abs(features["momentum_short"]) < trade.min_momentum:
+            return None
 
-        tick_bid = float(getattr(tick, "bid", float("nan")))
-        tick_ask = float(getattr(tick, "ask", float("nan")))
+        direction = "call" if prob_call >= prob_put else "put"
 
-        if direction == "buy":
-            entry = tick_ask if tick_ask > 0 else close_price
-            stop_loss = entry - self._config.risk.atr_stop_multiplier * atr
-            reward_rr = self._config.risk.reward_risk_ratio * (entry - stop_loss)
-            reward_atr = self._config.risk.atr_target_multiplier * atr
-            take_profit = entry + min(reward_rr, reward_atr)
-            score = prob_long
+        now = datetime.now(timezone.utc)
+        expiry = now + timedelta(seconds=trade.expiry_seconds)
+        entry_deadline = now + timedelta(seconds=trade.entry_window_seconds)
+
+        point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        if point <= 0 or bid <= 0 or ask <= 0:
+            return None
+
+        if direction == "call":
+            entry_price = ask
+            invalidation = entry_price - trade.entry_buffer_points * point
         else:
-            entry = tick_bid if tick_bid > 0 else close_price
-            stop_loss = entry + self._config.risk.atr_stop_multiplier * atr
-            reward_rr = self._config.risk.reward_risk_ratio * (stop_loss - entry)
-            reward_atr = self._config.risk.atr_target_multiplier * atr
-            take_profit = entry - min(reward_rr, reward_atr)
-            score = prob_short
-
-        stop_loss = float(stop_loss)
-        take_profit = float(max(take_profit, 0.0))
+            entry_price = bid
+            invalidation = entry_price + trade.entry_buffer_points * point
 
         notes = self._format_notes(features, direction)
+
         return SignalCandidate(
             direction=direction,
-            entry=float(entry),
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            probability=probability,
-            score=score,
-            timestamp=latest.name,
-            notes=notes,
+            confidence=confidence,
+            entry_price=float(entry_price),
+            reference_price=float(latest["close"]),
             spread_points=spread_points,
+            expiry_time=expiry,
+            entry_deadline=entry_deadline,
+            invalidation_price=float(invalidation),
+            momentum_short=float(features["momentum_short"]),
+            notes=notes,
+            timestamp=latest.name,
         )
 
     @staticmethod
     def _collect_features(latest: pd.Series, previous: pd.Series) -> Dict[str, float]:
-        cross_up = bool(latest["ema_fast"] > latest["ema_slow"]) and bool(
-            previous["ema_fast"] <= previous["ema_slow"]
-        )
-        cross_down = bool(latest["ema_fast"] < latest["ema_slow"]) and bool(
-            previous["ema_fast"] >= previous["ema_slow"]
-        )
-        ema_cross = 1.0 if cross_up else (-1.0 if cross_down else 0.0)
+        ema_fast_mid_gap = float(latest["ema_fast"] - latest["ema_mid"])
+        ema_mid_slow_gap = float(latest["ema_mid"] - latest["ema_slow"])
+        ema_fast_slope = float(latest["ema_fast_slope"])
+        ema_mid_slope = float(latest["ema_mid_slope"])
+        price_vs_ema_fast = float(latest["close"] - latest["ema_fast"])
+        price_vs_boll_mid = float(latest["close"] - latest["boll_mid"])
+        rsi_dev = float(latest["rsi"] - 50.0)
+        stoch_diff = float(latest["stoch_k"] - latest["stoch_d"])
+        macd_hist = float(latest["macd_hist"])
+        momentum_short = float(latest["momentum_short"])
+        momentum_long = float(latest["momentum_long"])
+        volatility = float(latest["volatility"])
+        atr = float(latest["atr"])
+        body_relative = float(latest["body_relative"])
+        upper_dist = float(latest["boll_upper"] - latest["close"])
+        lower_dist = float(latest["close"] - latest["boll_lower"])
 
         return {
-            "ema_gap": float(latest["ema_fast"] - latest["ema_slow"]),
-            "ema_trend": float(latest["close"] - latest["ema_trend"]),
-            "ema_cross": ema_cross,
-            "rsi": float(latest["rsi"]),
-            "macd_hist": float(latest["macd_hist"]),
-            "momentum": float(latest["momentum"]),
-            "volatility": float(latest["volatility"]),
-            "atr": float(latest["atr"]),
+            "ema_fast_mid_gap": ema_fast_mid_gap,
+            "ema_mid_slow_gap": ema_mid_slow_gap,
+            "ema_fast_slope": ema_fast_slope,
+            "ema_mid_slope": ema_mid_slope,
+            "price_vs_ema_fast": price_vs_ema_fast,
+            "price_vs_boll_mid": price_vs_boll_mid,
+            "rsi_dev": rsi_dev,
+            "stoch_diff": stoch_diff,
+            "macd_hist": macd_hist,
+            "momentum_short": momentum_short,
+            "momentum_long": momentum_long,
+            "volatility": volatility,
+            "atr": atr,
+            "body_relative": body_relative,
+            "upper_dist": upper_dist,
+            "lower_dist": lower_dist,
         }
 
-    def _score_probabilities(self, features: Dict[str, float]) -> tuple[float, float]:
-        weight_long = {
-            "ema_gap": 3.2,
-            "ema_trend": 1.8,
-            "ema_cross": 2.2,
-            "rsi": -0.05,
-            "macd_hist": 2.4,
-            "momentum": 1.6,
-            "volatility": -1.0,
+    def _score_probabilities(self, f: Dict[str, float]) -> Tuple[float, float]:
+        weight_call = {
+            "ema_fast_mid_gap": 3.2,
+            "ema_mid_slow_gap": 2.3,
+            "ema_fast_slope": 1.8,
+            "ema_mid_slope": 1.0,
+            "price_vs_ema_fast": 2.1,
+            "price_vs_boll_mid": 1.4,
+            "rsi_dev": -0.05,
+            "stoch_diff": 1.2,
+            "macd_hist": 2.6,
+            "momentum_short": 3.3,
+            "momentum_long": 1.7,
+            "volatility": -1.1,
+            "body_relative": 0.9,
+            "upper_dist": -0.4,
+            "lower_dist": 0.7,
         }
-        weight_short = {
-            "ema_gap": -3.2,
-            "ema_trend": -1.8,
-            "ema_cross": -2.2,
-            "rsi": 0.05,
-            "macd_hist": -2.4,
-            "momentum": -1.6,
-            "volatility": -1.0,
+        weight_put = {
+            "ema_fast_mid_gap": -3.2,
+            "ema_mid_slow_gap": -2.3,
+            "ema_fast_slope": -1.8,
+            "ema_mid_slope": -1.0,
+            "price_vs_ema_fast": -2.1,
+            "price_vs_boll_mid": -1.4,
+            "rsi_dev": 0.05,
+            "stoch_diff": -1.2,
+            "macd_hist": -2.6,
+            "momentum_short": -3.3,
+            "momentum_long": -1.7,
+            "volatility": -1.1,
+            "body_relative": -0.9,
+            "upper_dist": 0.7,
+            "lower_dist": -0.4,
+        }
+
+        normalisers = {
+            "ema_fast_mid_gap": 0.0015,
+            "ema_mid_slow_gap": 0.0015,
+            "ema_fast_slope": 0.0008,
+            "ema_mid_slope": 0.0006,
+            "price_vs_ema_fast": 0.0012,
+            "price_vs_boll_mid": 0.0015,
+            "rsi_dev": 20.0,
+            "stoch_diff": 20.0,
+            "macd_hist": 0.0004,
+            "momentum_short": 0.0004,
+            "momentum_long": 0.0004,
+            "volatility": 0.002,
+            "body_relative": 0.7,
+            "upper_dist": 0.001,
+            "lower_dist": 0.001,
         }
 
         bias = 0.05
@@ -511,36 +523,26 @@ class SignalEngine:
         def sigmoid(x: float) -> float:
             return 1 / (1 + math.exp(-x))
 
-        long_score = bias
-        short_score = bias
-        normalisers = {
-            "ema_gap": 0.75,
-            "ema_trend": 0.75,
-            "ema_cross": 1.0,
-            "rsi": 50.0,
-            "macd_hist": 0.00035,
-            "momentum": 0.35,
-            "volatility": 0.015,
-        }
+        call_score = bias
+        put_score = bias
+        for key, value in f.items():
+            norm = value / normalisers.get(key, 1.0)
+            call_score += weight_call.get(key, 0.0) * norm
+            put_score += weight_put.get(key, 0.0) * norm
 
-        for key, value in features.items():
-            normalised = value / normalisers.get(key, 1.0)
-            long_score += weight_long.get(key, 0.0) * normalised
-            short_score += weight_short.get(key, 0.0) * normalised
-
-        return sigmoid(long_score), sigmoid(short_score)
+        return sigmoid(call_score), sigmoid(put_score)
 
     @staticmethod
-    def _format_notes(features: Dict[str, float], direction: str) -> str:
-        parts = [
-            f"EMA gap {features['ema_gap']:.5f}",
-            f"RSI {features['rsi']:.2f}",
-            f"MACD hist {features['macd_hist']:.5f}",
-            f"Momentum {features['momentum']:.4f}",
-            f"Volatility {features['volatility']:.4f}",
-            f"ATR {features['atr']:.5f}",
+    def _format_notes(features: Dict[str, float], direction: str) -> List[str]:
+        return [
+            f"EMA gap fast-mid {features['ema_fast_mid_gap']*1e4:+.2f} pts",
+            f"Momentum short {features['momentum_short']:+.5f}",
+            f"Momentum long {features['momentum_long']:+.5f}",
+            f"RSI dev {features['rsi_dev']:+.2f}",
+            f"Stoch diff {features['stoch_diff']:+.2f}",
+            f"MACD hist {features['macd_hist']:+.5f}",
+            f"Volatility {features['volatility']:.5f}",
         ]
-        return f"{direction.upper()} bias | " + " | ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -549,33 +551,43 @@ class SignalEngine:
 
 
 class SignalPrinter:
-    """Render signals to stdout in an auditable, OCO-style format."""
-
     def __init__(self) -> None:
         self._last_timestamp: Optional[pd.Timestamp] = None
 
-    def emit(self, strategy: StrategyConfig, candidate: SignalCandidate, risk: RiskManager) -> None:
+    def emit(
+        self,
+        strategy: StrategyConfig,
+        candidate: SignalCandidate,
+        risk: RiskManager,
+        bid: float,
+        ask: float,
+    ) -> None:
         if candidate.timestamp == self._last_timestamp:
-            logging.debug("Signal already emitted for timestamp %s", candidate.timestamp)
+            logging.debug("Signal already emitted for %s", candidate.timestamp)
             return
 
-        size = risk.position_size(candidate.entry, candidate.stop_loss)
-        if size <= 0:
-            logging.info("Calculated position size is zero; skipping output")
+        if not risk.accept_direction(candidate.direction):
+            logging.info("Skipping signal due to consecutive %s limit", candidate.direction.upper())
             return
 
+        stake = risk.stake_size(candidate.confidence)
+        if stake <= 0:
+            logging.info("Calculated stake is zero; skipping")
+            return
+
+        direction_label = "CALL (expect price higher)" if candidate.direction == "call" else "PUT (expect price lower)"
         lines = [
-            "=" * 72,
-            f"{candidate.timestamp.isoformat()} | {strategy.symbol} | {strategy.timeframe}",
-            f"RECOMMENDATION: {candidate.direction.upper()} (prob. {candidate.probability:.2%}, score {candidate.score:.3f})",
-            f"ENTRY @ {candidate.entry:.5f}",
-            f"STOP  @ {candidate.stop_loss:.5f} ({strategy.risk.atr_stop_multiplier:.2f} x ATR)",
-            f"TARGET@ {candidate.take_profit:.5f} (R/R {strategy.risk.reward_risk_ratio:.2f})",
-            f"SIZE  ≈ {size:.2f} (risk {strategy.risk.risk_per_trade:.2%} of equity {strategy.risk.account_balance:.2f})",
-            f"SPREAD≈ {candidate.spread_points:.1f} pts (limit {strategy.max_spread_points:.1f})",
-            f"NOTES: {candidate.notes}",
-            "=" * 72,
+            "=" * 80,
+            f"{candidate.timestamp.isoformat()} | {strategy.symbol} | expiry {strategy.trade.expiry_seconds}s",
+            f"SIGNAL: {direction_label} | confidence {candidate.confidence:.2%} | spread {candidate.spread_points:.1f} pts",
+            f"ENTRY price {'≥' if candidate.direction == 'call' else '≤'} {candidate.entry_price:.5f} | bid {bid:.5f} | ask {ask:.5f}",
+            f"STAKE ≈ {stake:.2f} (risk {strategy.risk.risk_per_trade:.2%} of balance {strategy.risk.account_balance:.2f})",
+            f"INVALIDATE if price {'<' if candidate.direction == 'call' else '>'} {candidate.invalidation_price:.5f}",
+            f"ENTER by {candidate.entry_deadline.strftime('%H:%M:%S')} UTC | EXPIRY {candidate.expiry_time.strftime('%H:%M:%S')} UTC",
+            "NOTES:",
         ]
+        lines.extend(f" - {note}" for note in candidate.notes)
+        lines.append("=" * 80)
         print("\n".join(lines), flush=True)
         self._last_timestamp = candidate.timestamp
 
@@ -590,30 +602,30 @@ def run_strategy(
     once: bool,
     stop_flag: Optional[Callable[[], bool]] = None,
 ) -> None:
-    printer = SignalPrinter()
     active_config = config_manager.config
-    indicator_engine = IndicatorEngine(active_config.indicators)
-    signal_engine = SignalEngine(active_config)
-    risk_manager = RiskManager(active_config.risk)
     data_client = MT5DataClient(active_config)
+    indicator_engine = IndicatorEngine(active_config.indicators)
+    risk_manager = RiskManager(active_config.risk)
+    signal_engine = SignalEngine(active_config)
+    printer = SignalPrinter()
 
     while True:
         if stop_flag and stop_flag():
             break
 
         try:
-            updated_config = config_manager.maybe_reload()
+            new_config = config_manager.maybe_reload()
         except Exception as exc:
             logging.warning("Config reload failed: %s", exc)
-            updated_config = active_config
+            new_config = active_config
 
-        if updated_config != active_config:
+        if new_config != active_config:
             logging.info("Config change detected; rebuilding components")
-            active_config = updated_config
+            active_config = new_config
+            data_client.refresh(active_config)
             indicator_engine = IndicatorEngine(active_config.indicators)
             signal_engine = SignalEngine(active_config)
             risk_manager = RiskManager(active_config.risk)
-            data_client.refresh(active_config)
 
         try:
             candles = data_client.fetch_candles(active_config.history_candles)
@@ -647,26 +659,27 @@ def run_strategy(
         bid = float(getattr(tick, "bid", 0.0) or 0.0)
         ask = float(getattr(tick, "ask", 0.0) or 0.0)
         if point <= 0 or bid <= 0 or ask <= 0:
-            logging.warning("Invalid tick data received; skipping cycle")
+            logging.debug("Invalid tick data; skipping cycle")
             if once:
                 break
             time.sleep(active_config.loop_seconds)
             continue
 
         spread_points = (ask - bid) / point
-        if spread_points > active_config.max_spread_points:
+        if spread_points > active_config.trade.max_spread_points:
             logging.info(
                 "Spread %.1f exceeds threshold %.1f; skipping",
                 spread_points,
-                active_config.max_spread_points,
+                active_config.trade.max_spread_points,
             )
         else:
             candidate = signal_engine.evaluate(enriched, tick, symbol_info, spread_points)
-            if candidate and risk_manager.is_probability_acceptable(candidate.probability):
-                printer.emit(active_config, candidate, risk_manager)
+            if candidate and risk_manager.is_probability_acceptable(candidate.confidence):
+                printer.emit(active_config, candidate, risk_manager, bid, ask)
             else:
                 logging.info(
-                    "No trade candidate (probability below %.2f)",
+                    "No trade candidate (confidence %.2f < %.2f)",
+                    0.0 if candidate is None else candidate.confidence,
                     active_config.risk.min_probability,
                 )
 
@@ -682,37 +695,38 @@ def run_strategy(
 
 def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MetaTrader5 fixed-time trade signal generator (no auto-trading)",
+        description="MetaTrader5 fixed-time trading signal generator (no auto-trading)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--symbol", default="EURUSD", help="Instrument symbol as defined in MT5")
-    parser.add_argument("--timeframe", default="1m", help="Timeframe (e.g. 1m, 5m, 15m, 1h)")
-    parser.add_argument("--history", type=int, default=600, help="Number of candles to request each cycle")
-    parser.add_argument("--warmup", type=int, default=150, help="Minimum candles required before scoring")
+    parser.add_argument("--symbol", default="EURUSD", help="Instrument symbol in MT5")
+    parser.add_argument("--timeframe", default="1m", help="Base candle timeframe (e.g. 1m, 5m)")
+    parser.add_argument("--history", type=int, default=600, help="Number of candles per fetch")
+    parser.add_argument("--warmup", type=int, default=150, help="Minimum candles before scoring")
     parser.add_argument("--loop-seconds", type=int, default=30, help="Seconds between evaluations")
-    parser.add_argument("--max-spread", type=float, default=25.0, help="Maximum spread (points) to allow a trade")
-    parser.add_argument("--account", type=int, help="MT5 account number for API login")
-    parser.add_argument("--password", type=str, help="MT5 account password")
-    parser.add_argument("--server", type=str, help="MT5 trade server name")
-    parser.add_argument("--terminal-path", type=Path, help="Path to terminal64.exe (optional auto launch)")
-    parser.add_argument("--account-balance", type=float, default=1000.0, help="Account equity used for sizing")
-    parser.add_argument("--risk-per-trade", type=float, default=0.01, help="Risk percentage per trade (0-1)")
-    parser.add_argument("--max-trade-size", type=float, default=100.0, help="Upper cap on trade size units")
-    parser.add_argument("--min-probability", type=float, default=0.55, help="Minimum probability to emit a signal")
-    parser.add_argument("--config-path", type=Path, help="Optional JSON/YAML file for hot-reload configuration")
-    parser.add_argument("--log-level", default="INFO", help="Logging verbosity (DEBUG, INFO, WARNING, ERROR)")
-    parser.add_argument("--once", action="store_true", help="Run a single evaluation cycle and exit")
+    parser.add_argument("--account", type=int, help="MT5 account number (optional)")
+    parser.add_argument("--password", type=str, help="MT5 account password (optional)")
+    parser.add_argument("--server", type=str, help="MT5 trade server name (optional)")
+    parser.add_argument("--terminal-path", type=Path, help="Path to terminal64.exe (optional)")
+    parser.add_argument("--account-balance", type=float, default=1000.0, help="Balance used for stake sizing")
+    parser.add_argument("--risk-per-trade", type=float, default=0.02, help="Risk per trade as fraction")
+    parser.add_argument("--max-trade-size", type=float, default=100.0, help="Maximum stake size")
+    parser.add_argument("--min-probability", type=float, default=0.55, help="Minimum confidence to emit a signal")
+    parser.add_argument("--max-spread", type=float, default=25.0, help="Maximum spread in points")
+    parser.add_argument("--expiry-seconds", type=int, default=60, help="Fixed-time expiry in seconds")
+    parser.add_argument("--entry-window", type=int, default=15, help="Seconds allowed to enter after signal")
+    parser.add_argument("--config-path", type=Path, help="Optional JSON/YAML config file")
+    parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
+    parser.add_argument("--once", action="store_true", help="Run a single evaluation and exit")
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
 def build_config_from_args(args: argparse.Namespace) -> StrategyConfig:
-    base_config = StrategyConfig(
+    base = StrategyConfig(
         symbol=args.symbol,
         timeframe=args.timeframe,
         history_candles=args.history,
         warmup_candles=args.warmup,
         loop_seconds=args.loop_seconds,
-        max_spread_points=args.max_spread,
         account=args.account,
         password=args.password,
         server=args.server,
@@ -721,14 +735,21 @@ def build_config_from_args(args: argparse.Namespace) -> StrategyConfig:
     )
 
     risk = replace(
-        base_config.risk,
+        base.risk,
         account_balance=args.account_balance,
         risk_per_trade=args.risk_per_trade,
         max_trade_size=args.max_trade_size,
         min_probability=args.min_probability,
     )
 
-    return replace(base_config, risk=risk)
+    trade = replace(
+        base.trade,
+        expiry_seconds=args.expiry_seconds,
+        entry_window_seconds=args.entry_window,
+        max_spread_points=args.max_spread,
+    )
+
+    return replace(base, risk=risk, trade=trade)
 
 
 def configure_logging(level: str) -> None:
@@ -743,11 +764,11 @@ def configure_logging(level: str) -> None:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_arguments(argv)
     configure_logging(args.log_level)
-    base_config = build_config_from_args(args)
-    config_manager = ConfigManager(base_config)
+    config = build_config_from_args(args)
+    config_manager = ConfigManager(config)
 
     if args.config_path and not args.config_path.exists():
-        logging.warning("Config file %s does not exist yet; continuing with CLI parameters", args.config_path)
+        logging.warning("Config file %s does not exist; continuing with CLI parameters", args.config_path)
 
     try:
         initialize_mt5(config_manager.config)
@@ -757,15 +778,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     stop_requested = False
 
-    def _handle_signal(signum, frame):  # type: ignore[override]
+    def _signal_handler(signum: int, _: Any) -> None:
         nonlocal stop_requested
-        logging.info("Signal %s received; shutting down after current cycle", signum)
+        logging.info("Signal %s received; preparing to shut down", signum)
         stop_requested = True
 
     if hasattr(signal, "SIGINT"):
-        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGINT, _signal_handler)
     if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGTERM, _signal_handler)
 
     try:
         run_strategy(config_manager, once=args.once, stop_flag=lambda: stop_requested)
@@ -774,11 +795,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     finally:
         shutdown_mt5()
 
-    if stop_requested:
-        return 130
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
