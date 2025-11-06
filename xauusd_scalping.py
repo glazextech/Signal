@@ -259,7 +259,7 @@ def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="bfill").fillna(50)
+    return rsi.bfill().fillna(50)
 
 
 def calculate_atr(df: pd.DataFrame, period: int) -> pd.Series:
@@ -273,7 +273,7 @@ def calculate_atr(df: pd.DataFrame, period: int) -> pd.Series:
         axis=1,
     ).max(axis=1)
     atr = tr.rolling(window=period, min_periods=period).mean()
-    return atr.fillna(method="bfill")
+    return atr.bfill()
 
 
 def enrich_entry_dataframe(df: pd.DataFrame, params: StrategyParameters) -> pd.DataFrame:
