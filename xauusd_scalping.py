@@ -42,8 +42,8 @@ class StrategyConfig:
     ema_slow_period: int = 55
     rsi_period: int = 14
     atr_period: int = 14
-    atr_multiplier: float = 0.45
-    take_profit_multiplier: float = 1.8
+    stop_loss_pips: float = 10.0
+    take_profit_pips: float = 1.25
     min_tick_volume: int = 60
     volume_lookback: int = 120
     volume_quantile: float = 0.65
@@ -51,12 +51,18 @@ class StrategyConfig:
     ema_slope_threshold: float = 0.05
     ema_alignment_threshold: float = 0.08
     rsi_entry_buffer: float = 5.0
+    trend_rsi_buffer: float = 3.0
     atr_pct_min: float = 0.0006
     atr_pct_max: float = 0.0035
     vwap_distance_max_atr: float = 1.2
-    min_confidence: float = 0.62
+    min_confidence: float = 0.65
     cooldown_bars: int = 3
     max_spread_points: float = 45.0
+    candle_body_ratio_min: float = 0.28
+    wick_ratio_max: float = 0.55
+    swing_window: int = 30
+    swing_bias_buy: float = 0.55
+    swing_bias_sell: float = 0.45
 
 
 @dataclass
@@ -177,6 +183,18 @@ class ScalpingStrategy:
         df["rsi_delta"] = df["rsi"].diff()
         df["atr_pct"] = df["atr"] / df["close"].replace(0, np.nan)
 
+        df["candle_body"] = (df["close"] - df["open"]).abs()
+        df["candle_range"] = df["high"] - df["low"]
+        df["candle_range"] = df["candle_range"].replace(0, np.nan)
+        df["candle_body_ratio"] = df["candle_body"] / df["candle_range"]
+
+        upper_anchor = df[["open", "close"]].max(axis=1)
+        lower_anchor = df[["open", "close"]].min(axis=1)
+        df["upper_wick"] = (df["high"] - upper_anchor).clip(lower=0)
+        df["lower_wick"] = (lower_anchor - df["low"]).clip(lower=0)
+        df["upper_wick_ratio"] = df["upper_wick"] / df["candle_range"]
+        df["lower_wick_ratio"] = df["lower_wick"] / df["candle_range"]
+
         df = df.dropna()
         if df.empty:
             raise RuntimeError("Giriş verisi hesaplanamadı.")
@@ -190,6 +208,9 @@ class ScalpingStrategy:
         trend_row: pd.Series,
         tick,
         volume_floor: float,
+        pip_value: float,
+        swing_high: float,
+        swing_low: float,
     ) -> Tuple[Optional[dict], Tuple[str, ...]]:
         direction_sign = 1 if direction == "BUY" else -1
 
@@ -235,10 +256,15 @@ class ScalpingStrategy:
             f"Giriş EMA farkı {entry_gap:+.3f}",
         )
 
-        fast_slope = (entry_row["ema_fast_slope"] or 0.0) * direction_sign
-        slow_slope = (entry_row["ema_slow_slope"] or 0.0) * direction_sign
-        ema_momentum = (entry_row["ema_diff_delta"] or 0.0) * direction_sign
-        prev_entry_gap = (previous_row["ema_diff"] or 0.0) * direction_sign
+        fast_slope = float(entry_row["ema_fast_slope"]) if pd.notna(entry_row["ema_fast_slope"]) else 0.0
+        slow_slope = float(entry_row["ema_slow_slope"]) if pd.notna(entry_row["ema_slow_slope"]) else 0.0
+        ema_momentum = float(entry_row["ema_diff_delta"]) if pd.notna(entry_row["ema_diff_delta"]) else 0.0
+        prev_entry_gap_val = float(previous_row["ema_diff"]) if pd.notna(previous_row["ema_diff"]) else 0.0
+
+        fast_slope *= direction_sign
+        slow_slope *= direction_sign
+        ema_momentum *= direction_sign
+        prev_entry_gap = prev_entry_gap_val * direction_sign
 
         add_condition(
             "EMA fast slope",
@@ -284,6 +310,14 @@ class ScalpingStrategy:
             f"RSI Δ {rsi_delta:+.2f}",
         )
 
+        trend_rsi = float(trend_row["rsi"]) if pd.notna(trend_row["rsi"]) else 50.0
+        add_condition(
+            "Trend RSI",
+            (trend_rsi - 50) * direction_sign > self.config.trend_rsi_buffer,
+            1.2,
+            f"Trend RSI {trend_rsi:.1f}",
+        )
+
         tick_volume = float(entry_row["tick_volume"])
         add_condition(
             "Volume boost",
@@ -298,6 +332,45 @@ class ScalpingStrategy:
             self.config.atr_pct_min <= atr_pct <= self.config.atr_pct_max,
             0.7,
             f"ATR% {atr_pct:.4f}",
+        )
+
+        body_ratio = float(entry_row["candle_body_ratio"]) if pd.notna(entry_row["candle_body_ratio"]) else 0.0
+        candle_direction = (entry_row["close"] - entry_row["open"]) * direction_sign
+        add_condition(
+            "Candle body",
+            candle_direction > 0 and body_ratio >= self.config.candle_body_ratio_min,
+            0.9,
+            f"Gövde oranı {body_ratio:.2f}",
+        )
+
+        upper_wick_ratio = float(entry_row["upper_wick_ratio"]) if pd.notna(entry_row["upper_wick_ratio"]) else 0.0
+        lower_wick_ratio = float(entry_row["lower_wick_ratio"]) if pd.notna(entry_row["lower_wick_ratio"]) else 0.0
+        wick_ratio = upper_wick_ratio if direction == "BUY" else lower_wick_ratio
+        add_condition(
+            "Wick control",
+            wick_ratio <= self.config.wick_ratio_max,
+            0.6,
+            f"Fitil oranı {wick_ratio:.2f}",
+        )
+
+        swing_span = swing_high - swing_low
+        if swing_span <= 0:
+            swing_position = 0.5
+        else:
+            swing_position = (price - swing_low) / swing_span
+
+        if direction == "BUY":
+            swing_pass = swing_position >= self.config.swing_bias_buy
+            swing_detail = f"Swing pozisyonu {swing_position:.2f} (>= {self.config.swing_bias_buy:.2f})"
+        else:
+            swing_pass = swing_position <= self.config.swing_bias_sell
+            swing_detail = f"Swing pozisyonu {swing_position:.2f} (<= {self.config.swing_bias_sell:.2f})"
+
+        add_condition(
+            "Swing bias",
+            swing_pass,
+            0.9,
+            swing_detail,
         )
 
         vwap = float(entry_row["vwap"])
@@ -319,8 +392,10 @@ class ScalpingStrategy:
             for name, passed, _, detail in conditions
         )
 
-        stop_loss = price - direction_sign * self.config.atr_multiplier * atr_value
-        take_profit = price + direction_sign * self.config.take_profit_multiplier * atr_value
+        sl_offset = self.config.stop_loss_pips * pip_value
+        tp_offset = self.config.take_profit_pips * pip_value
+        stop_loss = price - direction_sign * sl_offset
+        take_profit = price + direction_sign * tp_offset
 
         return (
             {
@@ -368,6 +443,15 @@ class ScalpingStrategy:
                 reasons=reasons,
             )
 
+        pip_value = symbol_info.point
+        if pip_value <= 0:
+            raise RuntimeError("Geçersiz point değeri alındı.")
+
+        swing_window = max(5, self.config.swing_window)
+        recent_slice = entry_df.tail(swing_window)
+        swing_high = float(recent_slice["high"].max())
+        swing_low = float(recent_slice["low"].min())
+
         volume_series = entry_df["tick_volume"].tail(max(self.config.volume_lookback, 10))
         dynamic_threshold = volume_series.quantile(self.config.volume_quantile)
         if np.isnan(dynamic_threshold):
@@ -385,6 +469,9 @@ class ScalpingStrategy:
                 trend_row,
                 tick,
                 volume_floor,
+                pip_value,
+                swing_high,
+                swing_low,
             )
             if evaluation:
                 evaluations.append(evaluation)
