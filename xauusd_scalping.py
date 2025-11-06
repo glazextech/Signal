@@ -19,8 +19,10 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Optional, Tuple
+
+import math
 
 import MetaTrader5 as mt5
 import numpy as np
@@ -34,46 +36,56 @@ _LOGGER = logging.getLogger(__name__)
 class StrategyConfig:
     """Strateji ayarları."""
 
-    symbol: str = "GOLD#"
-    trend_timeframe: int = mt5.TIMEFRAME_M5
+    symbol: str = "XAUUSD"
+    trend_timeframe: int = mt5.TIMEFRAME_M15
     entry_timeframe: int = mt5.TIMEFRAME_M1
-    trend_lookback: int = 600
-    entry_lookback: int = 400
-    ema_fast_period: int = 21
-    ema_slow_period: int = 55
-    rsi_period: int = 14
+    trend_lookback: int = 400
+    entry_lookback: int = 300
+    ema_fast_period: int = 34
+    ema_slow_period: int = 89
+    rsi_period: int = 21
     atr_period: int = 14
-    stop_loss_pips: float = 10.0
-    take_profit_pips: float = 1.25
-    min_tick_volume: int = 60
-    volume_lookback: int = 120
-    volume_quantile: float = 0.65
-    ema_slope_period: int = 3
-    ema_slope_threshold: float = 0.05
-    ema_alignment_threshold: float = 0.08
-    rsi_entry_buffer: float = 5.0
-    trend_rsi_buffer: float = 3.0
-    atr_pct_min: float = 0.0006
-    atr_pct_max: float = 0.0035
-    vwap_distance_max_atr: float = 1.2
-    min_confidence: float = 0.7
-    cooldown_bars: int = 3
-    max_spread_points: float = 45.0
-    candle_body_ratio_min: float = 0.28
-    wick_ratio_max: float = 0.55
-    swing_window: int = 30
-    swing_bias_buy: float = 0.55
-    swing_bias_sell: float = 0.45
-    min_close_momentum_pips: float = 2.0
-    noise_ratio_window: int = 8
-    noise_ratio_threshold: float = 1.7
-    max_total_wick_ratio: float = 2.4
-    atr_regime_min_ratio: float = 0.55
-    max_atr_spike_ratio: float = 2.1
-    volatility_regime_window: int = 90
+    stop_atr_multiplier: float = 1.35
+    tp_atr_multiplier: float = 2.2
+    reward_multiple: float = 2.0
+    min_stop_points: float = 0.6
+    max_stop_points: float = 4.8
+    min_tick_volume: int = 70
+    volume_lookback: int = 150
+    volume_quantile: float = 0.7
+    ema_slope_period: int = 4
+    ema_slope_threshold: float = 0.04
+    ema_alignment_threshold: float = 0.1
+    rsi_entry_buffer: float = 4.5
+    trend_rsi_buffer: float = 5.0
+    atr_pct_min: float = 0.0008
+    atr_pct_max: float = 0.0042
+    vwap_distance_max_atr: float = 1.1
+    min_confidence: float = 0.72
+    cooldown_bars: int = 4
+    max_spread_points: float = 60.0
+    candle_body_ratio_min: float = 0.32
+    wick_ratio_max: float = 0.45
+    swing_window: int = 34
+    swing_bias_buy: float = 0.6
+    swing_bias_sell: float = 0.4
+    min_close_momentum_pips: float = 1.8
+    noise_ratio_window: int = 10
+    noise_ratio_threshold: float = 1.5
+    max_total_wick_ratio: float = 2.0
+    atr_regime_min_ratio: float = 0.6
+    max_atr_spike_ratio: float = 1.9
+    volatility_regime_window: int = 120
     enable_session_filter: bool = True
-    session_utc_ranges: Tuple[Tuple[int, int], ...] = ((6, 12), (13, 20))
+    session_utc_ranges: Tuple[Tuple[int, int], ...] = ((6, 11.5), (13, 19.5))
     max_same_direction_signals: int = 2
+    min_lot: float = 0.10
+    lot_step: float = 0.01
+    max_lot: float = 2.0
+    risk_per_trade: float = 0.02
+    max_daily_risk: float = 0.08
+    max_trades_per_day: int = 6
+    max_open_positions: int = 2
 
 
 @dataclass
@@ -88,6 +100,11 @@ class Signal:
     take_profit: Optional[float] = None
     confidence: float = 0.0
     reasons: Tuple[str, ...] = ()
+    lot: Optional[float] = None
+    risk_amount: Optional[float] = None
+    risk_cap: Optional[float] = None
+    equity: Optional[float] = None
+    stop_distance: Optional[float] = None
 
 
 def initialize_mt5(account: Optional[int] = None,
@@ -167,6 +184,9 @@ class ScalpingStrategy:
         self.config = config
         self._last_signal_time: Optional[datetime] = None
         self._recent_directions: deque[str] = deque(maxlen=10)
+        self._daily_risk_spent: float = 0.0
+        self._daily_date: Optional[date] = None
+        self._trades_today: int = 0
 
     def _prepare_trend_dataframe(self) -> pd.DataFrame:
         df = fetch_rates(self.config.symbol, self.config.trend_timeframe, self.config.trend_lookback)
@@ -223,6 +243,42 @@ class ScalpingStrategy:
             if start <= hour_fraction < end:
                 return True
         return False
+
+    def _compute_position_sizing(
+        self,
+        symbol_info,
+        stop_distance: float,
+        account_info,
+    ) -> Optional[Tuple[float, float, float, float, float]]:
+        if account_info is None:
+            return None
+
+        tick_value = symbol_info.trade_tick_value or 0.0
+        tick_size = symbol_info.trade_tick_size or symbol_info.point or 0.0
+        if tick_value <= 0 or tick_size <= 0 or stop_distance <= 0:
+            return None
+
+        equity = float(account_info.equity)
+        risk_cap = equity * self.config.risk_per_trade
+        value_per_price_unit = tick_value / tick_size
+        risk_per_lot = stop_distance * value_per_price_unit
+        if risk_per_lot <= 0:
+            return None
+
+        raw_lot = risk_cap / risk_per_lot
+        lot = max(self.config.min_lot, min(self.config.max_lot, raw_lot))
+        lot = math.floor(lot / self.config.lot_step) * self.config.lot_step
+        lot = max(self.config.min_lot, lot)
+
+        actual_risk = risk_per_lot * lot
+        if actual_risk > risk_cap and stop_distance > self.config.min_stop_points:
+            adjusted_stop = max(self.config.min_stop_points, risk_cap / (value_per_price_unit * lot))
+            if adjusted_stop < stop_distance:
+                stop_distance = adjusted_stop
+                risk_per_lot = stop_distance * value_per_price_unit
+                actual_risk = risk_per_lot * lot
+
+        return lot, stop_distance, actual_risk, risk_cap, equity
 
     def _evaluate_direction(
         self,
@@ -452,19 +508,16 @@ class ScalpingStrategy:
             for name, passed, _, detail in conditions
         )
 
-        sl_offset = self.config.stop_loss_pips * pip_value
-        tp_offset = self.config.take_profit_pips * pip_value
-        stop_loss = price - direction_sign * sl_offset
-        take_profit = price + direction_sign * tp_offset
-
         return (
             {
                 "direction": direction,
                 "price": float(price),
-                "stop_loss": float(stop_loss),
-                "take_profit": float(take_profit),
                 "confidence": float(confidence),
                 "reasons": reasons,
+                "atr": float(atr_value),
+                "rsi": float(rsi_value),
+                "trend_rsi": float(trend_rsi),
+                "tick_volume": tick_volume,
             },
             tuple(),
         )
@@ -484,6 +537,12 @@ class ScalpingStrategy:
         previous_row = entry_df.iloc[-2]
 
         entry_timestamp = entry_row.name.to_pydatetime().astimezone(timezone.utc)
+
+        today = entry_timestamp.date()
+        if self._daily_date != today:
+            self._daily_date = today
+            self._daily_risk_spent = 0.0
+            self._trades_today = 0
 
         if not self._is_active_session(entry_timestamp):
             reasons = (
@@ -505,6 +564,35 @@ class ScalpingStrategy:
         symbol_info = mt5.symbol_info(self.config.symbol)
         if not symbol_info or symbol_info.point == 0:
             raise RuntimeError("Sembol bilgisi eksik veya geçersiz.")
+
+        account_info = mt5.account_info()
+        if account_info and self._daily_risk_spent >= account_info.equity * self.config.max_daily_risk:
+            reasons = (
+                f"Günlük risk limiti aşıldı ({self._daily_risk_spent:.2f} USD)",
+            )
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(entry_row["close"]),
+                confidence=0.0,
+                reasons=reasons,
+                equity=float(account_info.equity),
+            )
+
+        if self._trades_today >= self.config.max_trades_per_day:
+            reasons = (
+                f"Günlük maksimum işlem sayısı ({self.config.max_trades_per_day}) doldu.",
+            )
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(entry_row["close"]),
+                confidence=0.0,
+                reasons=reasons,
+                equity=float(account_info.equity) if account_info else None,
+            )
 
         spread_points = (tick.ask - tick.bid) / symbol_info.point
         if spread_points > self.config.max_spread_points:
@@ -650,18 +738,105 @@ class ScalpingStrategy:
                 reasons=reasons,
             )
 
+        atr_for_stop = max(best.get("atr", float(entry_row["atr"])), 1e-6)
+        direction_sign = 1 if best["direction"] == "BUY" else -1
+        base_stop_distance = atr_for_stop * self.config.stop_atr_multiplier
+        stop_distance = max(self.config.min_stop_points, min(self.config.max_stop_points, base_stop_distance))
+        tp_distance = stop_distance * self.config.reward_multiple
+        tp_distance = max(tp_distance, atr_for_stop * self.config.tp_atr_multiplier)
+        tp_distance = min(tp_distance, self.config.max_stop_points * self.config.reward_multiple)
+
+        sizing = self._compute_position_sizing(symbol_info, stop_distance, account_info)
+        if sizing is None:
+            reasons = best["reasons"] + ("Pozisyon boyutu hesaplanamadı (risk verisi).",)
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(best["price"]),
+                confidence=float(best["confidence"]),
+                reasons=reasons,
+                equity=float(account_info.equity) if account_info else None,
+            )
+
+        lot, adjusted_stop_distance, actual_risk, risk_cap, equity = sizing
+        stop_distance = adjusted_stop_distance
+        tp_distance = max(tp_distance, stop_distance * self.config.reward_multiple)
+
+        if risk_cap <= 0 or actual_risk <= 0:
+            reasons = best["reasons"] + ("Risk hesabı sıfırlandı.",)
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(best["price"]),
+                confidence=float(best["confidence"]),
+                reasons=reasons,
+                equity=equity,
+            )
+
+        if actual_risk > risk_cap * 1.4:
+            reasons = best["reasons"] + (f"Risk {actual_risk:.2f} USD > izin {risk_cap:.2f} USD",)
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(best["price"]),
+                confidence=float(best["confidence"]),
+                reasons=reasons,
+                equity=equity,
+            )
+
+        if account_info and (self._daily_risk_spent + actual_risk) > account_info.equity * self.config.max_daily_risk:
+            reasons = best["reasons"] + ("Günlük risk limiti bu işlemle aşılacak.",)
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(best["price"]),
+                confidence=float(best["confidence"]),
+                reasons=reasons,
+                equity=equity,
+            )
+
+        open_positions = mt5.positions_get(symbol=self.config.symbol) or []
+        if isinstance(open_positions, tuple):
+            open_positions = list(open_positions)
+        if len(open_positions) >= self.config.max_open_positions:
+            reasons = best["reasons"] + (f"Açık pozisyon limiti ({self.config.max_open_positions}) dolu.",)
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(best["price"]),
+                confidence=float(best["confidence"]),
+                reasons=reasons,
+                equity=equity,
+            )
+
+        price = float(best["price"])
+        stop_loss = price - direction_sign * stop_distance
+        take_profit = price + direction_sign * tp_distance
+
         self._last_signal_time = entry_timestamp
         self._recent_directions.append(best["direction"])
+        self._daily_risk_spent += actual_risk
+        self._trades_today += 1
 
         return Signal(
             symbol=self.config.symbol,
             direction=best["direction"],
             timestamp=entry_timestamp,
-            price=float(best["price"]),
-            stop_loss=float(best["stop_loss"]),
-            take_profit=float(best["take_profit"]),
+            price=price,
+            stop_loss=float(stop_loss),
+            take_profit=float(take_profit),
             confidence=float(best["confidence"]),
             reasons=best["reasons"],
+            lot=float(lot),
+            risk_amount=float(actual_risk),
+            risk_cap=float(risk_cap),
+            equity=float(equity),
+            stop_distance=float(stop_distance),
         )
 
 
@@ -683,10 +858,19 @@ def example_usage(counter: int) -> None:
         if signal.direction == "BUY":
             counter += 1
             print(f"[{counter}] BUY Sinyali ({signal.confidence:.0%}) Fiyat: {signal.price:.2f}")
+            if signal.lot:
+                print(
+                    f"    Lot: {signal.lot:.2f} | Risk: {signal.risk_amount:.2f} / Limit: {signal.risk_cap:.2f} | Equity: {signal.equity:.2f}"
+                )
+            if signal.stop_loss and signal.take_profit:
+                print(
+                    f"    SL: {signal.stop_loss:.2f} | TP: {signal.take_profit:.2f} | Mesafe: {signal.stop_distance:.3f}"
+                )
             print_reasons("Filtreler:", signal.reasons)
 
             positions = mt5.positions_get(symbol=signal.symbol)
-            if positions and len(positions) >= 3:
+            max_positions = strategy.config.max_open_positions
+            if positions and len(positions) >= max_positions:
                 print("Açık pozisyon limiti dolu → Yeni işlem açılmıyor.")
                 return
 
@@ -696,7 +880,7 @@ def example_usage(counter: int) -> None:
                 return
 
             price = tick.ask
-            lot = 0.25
+            lot = signal.lot or strategy.config.min_lot
             deviation = 20
 
             request = {
@@ -718,8 +902,8 @@ def example_usage(counter: int) -> None:
                 ticket = result.order
                 print(f"BUY açıldı! Ticket: {ticket}")
 
-                tp_price = signal.take_profit if signal.take_profit else price + 0.04
-                sl_price = signal.stop_loss if signal.stop_loss else price - 0.04
+                tp_price = signal.take_profit if signal.take_profit else price + 0.40
+                sl_price = signal.stop_loss if signal.stop_loss else price - 0.20
 
                 modify_request = {
                     "action": mt5.TRADE_ACTION_SLTP,
@@ -734,10 +918,19 @@ def example_usage(counter: int) -> None:
         elif signal.direction == "SELL":
             counter += 1
             print(f"[{counter}] SELL Sinyali ({signal.confidence:.0%}) Fiyat: {signal.price:.2f}")
+            if signal.lot:
+                print(
+                    f"    Lot: {signal.lot:.2f} | Risk: {signal.risk_amount:.2f} / Limit: {signal.risk_cap:.2f} | Equity: {signal.equity:.2f}"
+                )
+            if signal.stop_loss and signal.take_profit:
+                print(
+                    f"    SL: {signal.stop_loss:.2f} | TP: {signal.take_profit:.2f} | Mesafe: {signal.stop_distance:.3f}"
+                )
             print_reasons("Filtreler:", signal.reasons)
 
             positions = mt5.positions_get(symbol=signal.symbol)
-            if positions and len(positions) >= 3:
+            max_positions = strategy.config.max_open_positions
+            if positions and len(positions) >= max_positions:
                 print("Açık pozisyon limiti dolu → İşlem açılmıyor.")
                 return
 
@@ -747,7 +940,7 @@ def example_usage(counter: int) -> None:
                 return
 
             price = tick.bid
-            lot = 0.08
+            lot = signal.lot or strategy.config.min_lot
             deviation = 20
 
             request = {
@@ -769,8 +962,8 @@ def example_usage(counter: int) -> None:
                 ticket = result.order
                 print(f"SELL açıldı! Ticket: {ticket}")
 
-                tp_price = signal.take_profit if signal.take_profit else price - 0.04
-                sl_price = signal.stop_loss if signal.stop_loss else price + 0.04
+                tp_price = signal.take_profit if signal.take_profit else price - 0.40
+                sl_price = signal.stop_loss if signal.stop_loss else price + 0.20
 
                 modify_request = {
                     "action": mt5.TRADE_ACTION_SLTP,
