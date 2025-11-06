@@ -50,8 +50,10 @@ class StrategyConfig:
     ema_fast_period: int = 9
     ema_slow_period: int = 21
     rsi_period: int = 14
-    rsi_upper: float = 65.0
-    rsi_lower: float = 35.0
+    rsi_upper: float = 62.0
+    rsi_lower: float = 38.0
+    min_cross_atr_ratio: float = 0.08
+    min_rsi_turn: float = 0.75
     reward_risk_ratio: float = 1.5
     account: Optional[int] = None
     password: Optional[str] = None
@@ -184,8 +186,35 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
     bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
 
     atr_points = latest["atr"]
+    if pd.isna(atr_points) or atr_points <= 0:
+        logging.debug("ATR invalid (%.5f); skipping signal.", float(atr_points))
+        return None
 
-    if bullish_cross and latest["rsi"] < config.rsi_upper:
+    ema_gap = abs(latest["ema_fast"] - latest["ema_slow"])
+    min_gap = config.min_cross_atr_ratio * atr_points
+
+    rsi_slope = latest["rsi"] - previous["rsi"]
+    price_momentum = latest["close"] - previous["close"]
+
+    buy_condition = (
+        bullish_cross
+        and ema_gap >= min_gap
+        and latest["rsi"] <= config.rsi_lower
+        and rsi_slope >= config.min_rsi_turn
+        and price_momentum > 0
+        and latest["close"] >= latest["ema_fast"]
+    )
+
+    sell_condition = (
+        bearish_cross
+        and ema_gap >= min_gap
+        and latest["rsi"] >= config.rsi_upper
+        and rsi_slope <= -config.min_rsi_turn
+        and price_momentum < 0
+        and latest["close"] <= latest["ema_fast"]
+    )
+
+    if buy_condition:
         entry = latest["ask"]
         stop_loss = entry - 1.5 * atr_points
         take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
@@ -198,7 +227,7 @@ def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[Tr
             comment="EMA bull cross + RSI filter",
         )
 
-    if bearish_cross and latest["rsi"] > config.rsi_lower:
+    if sell_condition:
         entry = latest["bid"]
         stop_loss = entry + 1.5 * atr_points
         take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
