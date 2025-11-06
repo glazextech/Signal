@@ -1,14 +1,14 @@
 """Binance spot market research and OCO signal assistant.
 
-This script inspects all USDT spot pairs on Binance, keeps only the coins
-that fit inside the trader's budget, and evaluates them with multiple
-indicators before proposing a single, best-effort OCO order idea.
+This script inspects every USDT spot pair on Binance, evaluates them with a
+layered indicator stack, and proposes a best-effort OCO order idea based on
+the strongest probabilistic edge it can detect.
 
 Design goals
 ------------
-* Fetch fresh ticker, order book, and kline data via the public REST API.
-* Filter symbols aggressively so we never recommend unaffordable or illiquid
-  instruments. This keeps the bot focused on realistic trades.
+ * Fetch fresh ticker, order book, and kline data via the public REST API.
+ * Filter symbols only for liquidity so even high-priced majors remain in
+   scope, while still avoiding untradeable books.
 * Compute layered technical signals (EMA, RSI, MACD, momentum, volatility)
   and convert them into a probabilistic confidence score for a >=5% move.
 * Respect configurable risk limits so the suggested position size never
@@ -18,14 +18,14 @@ Design goals
 
 Usage
 -----
-    python binance_bot.py --budget 25 --max-risk 0.12 --verbose
+    python binance_bot.py --budget 250 --max-risk 0.12 --verbose
 
 Dependencies
 ------------
     pip install requests pandas numpy
 
-IMPORTANT: Binance applies rate limits. This script keeps requests modest,
-but for production you may need API keys plus backoff logic.
+IMPORTANT: Binance applies rate limits. This script paces order book
+requests, but for production you may need API keys, caching, or backoff.
 """
 
 from __future__ import annotations
@@ -48,9 +48,9 @@ import requests
 
 @dataclass
 class BudgetConfig:
-    """Handle user budget and risk appetite."""
+    """Describe trader capital and risk appetite for position sizing."""
 
-    total_budget: float = 20.0
+    total_budget: float = 200.0
     max_risk_per_trade: float = 0.10  # allocate at most 10% of capital per idea
     quote_asset: str = "USDT"  # concentrate on liquid USD-quoted markets
 
@@ -83,7 +83,7 @@ class RiskParams:
     min_profit_target: float = 0.05  # ensure >=5% upside target
     stop_loss_atr_multiplier: float = 1.5
     take_profit_atr_multiplier: float = 3.0
-    max_candidates: int = 40  # safeguard against rate-limit blowups
+    max_candidates: Optional[int] = None  # analyze all unless user caps it
 
 
 @dataclass
@@ -227,11 +227,11 @@ def fetch_data(
     budget: BudgetConfig,
     risk: RiskParams,
 ) -> List[MarketSnapshot]:
-    """Collect market snapshots for affordable, liquid symbols."""
+    """Collect market snapshots for liquid symbols that pass exchange filters."""
 
     stats = fetch_ticker_stats(session, budget.quote_asset)
 
-    affordable: List[Dict[str, str]] = []
+    eligible: List[Dict[str, str]] = []
     for entry in stats:
         try:
             price = float(entry["lastPrice"])
@@ -247,15 +247,6 @@ def fetch_data(
             logging.debug("Skipping %s due to non-positive price", symbol)
             continue
 
-        if price > budget.total_budget:
-            logging.debug(
-                "Skipping %s because price %.4f exceeds budget %.2f",
-                symbol,
-                price,
-                budget.total_budget,
-            )
-            continue
-
         if quote_volume < risk.min_quote_volume:
             logging.debug(
                 "Skipping %s due to low 24h quote volume: %.2f < %.2f",
@@ -265,18 +256,27 @@ def fetch_data(
             )
             continue
 
-        affordable.append(entry)
+        eligible.append(entry)
 
-    affordable = sorted(
-        affordable,
+    eligible = sorted(
+        eligible,
         key=lambda item: float(item["quoteVolume"]),
         reverse=True,
-    )[: risk.max_candidates]
+    )
 
-    logging.info("Affordable + liquid shortlist: %d symbols", len(affordable))
+    total_candidates = len(eligible)
+    if risk.max_candidates is not None and total_candidates > risk.max_candidates:
+        logging.info(
+            "Candidate list capped from %d to %d by max_candidates",
+            total_candidates,
+            risk.max_candidates,
+        )
+        eligible = eligible[: risk.max_candidates]
+
+    logging.info("Eligible liquid shortlist: %d symbols", len(eligible))
 
     snapshots: List[MarketSnapshot] = []
-    for entry in affordable:
+    for entry in eligible:
         symbol = entry["symbol"]
 
         try:
@@ -527,6 +527,27 @@ def generate_oco_signal(result: AnalysisResult) -> str:
         f"Success probability: {prob_percent:.1f}%",
         f"Rationale: {result.reasoning}",
     ]
+
+    metric_order = [
+        "rsi",
+        "macd",
+        "macd_hist",
+        "momentum",
+        "trend_strength",
+        "volatility",
+        "atr",
+    ]
+    metric_lines = []
+    for key in metric_order:
+        value = result.metrics.get(key)
+        if value is None:
+            continue
+        metric_lines.append(f"  {key}: {value:.6f}")
+
+    if metric_lines:
+        lines.append("Key metrics:")
+        lines.extend(metric_lines)
+
     return "\n".join(lines)
 
 
@@ -558,14 +579,14 @@ def log_results(results: List[AnalysisResult]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Binance affordable coin screener with OCO output")
-    parser.add_argument("--budget", type=float, default=20.0, help="Total budget in quote asset (default: 20 USDT)")
+    parser = argparse.ArgumentParser(description="Binance all-market screener with OCO output")
+    parser.add_argument("--budget", type=float, default=200.0, help="Total capital in quote asset for position sizing")
     parser.add_argument("--max-risk", type=float, default=0.10, help="Max fraction of budget to risk per trade")
     parser.add_argument("--min-volume", type=float, default=1_000_000.0, help="Minimum 24h quote volume")
     parser.add_argument("--min-depth", type=float, default=10_000.0, help="Minimum combined order book notional")
     parser.add_argument("--quote", type=str, default="USDT", help="Quote asset to analyse (default: USDT)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--max-candidates", type=int, default=40, help="Maximum affordable symbols to analyse")
+    parser.add_argument("--max-candidates", type=int, default=None, help="Optional cap on number of symbols to analyse")
     return parser.parse_args()
 
 
@@ -590,7 +611,11 @@ def main() -> None:
         max_candidates=args.max_candidates,
     )
 
-    logging.info("Starting Binance spot scan with budget %.2f %s", budget.total_budget, budget.quote_asset)
+    logging.info(
+        "Starting Binance spot scan across all %s markets with capital %.2f",
+        budget.quote_asset,
+        budget.total_budget,
+    )
     logging.debug("Budget config: %s", budget)
     logging.debug("Risk params: %s", risk)
     logging.debug("Indicator params: %s", indicators)
