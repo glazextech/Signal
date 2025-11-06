@@ -408,6 +408,7 @@ class SignalEngine:
 
         features = self._collect_features(latest, previous)
         prob_long, prob_short = self._score_probabilities(features)
+        prob_gap = abs(prob_long - prob_short)
 
         logging.debug(
             "Features: %s prob_long=%.3f prob_short=%.3f",
@@ -416,8 +417,14 @@ class SignalEngine:
             prob_short,
         )
 
-        if prob_long < self._config.risk.min_probability and prob_short < self._config.risk.min_probability:
-            return None
+        min_prob = self._config.risk.min_probability
+        if prob_long < min_prob and prob_short < min_prob:
+            if prob_gap < 0.05:
+                return None
+            # allow compelling relative edge even if absolute probability is slightly low
+            boost = min_prob * 0.95
+            prob_long = max(prob_long, boost)
+            prob_short = max(prob_short, boost)
 
         direction = "buy" if prob_long >= prob_short else "sell"
         probability = max(prob_long, prob_short)
@@ -481,25 +488,25 @@ class SignalEngine:
 
     def _score_probabilities(self, features: Dict[str, float]) -> tuple[float, float]:
         weight_long = {
-            "ema_gap": 2.0,
-            "ema_trend": 1.2,
-            "ema_cross": 1.5,
-            "rsi": -0.04,
-            "macd_hist": 1.8,
-            "momentum": 1.2,
-            "volatility": -0.8,
+            "ema_gap": 3.2,
+            "ema_trend": 1.8,
+            "ema_cross": 2.2,
+            "rsi": -0.05,
+            "macd_hist": 2.4,
+            "momentum": 1.6,
+            "volatility": -1.0,
         }
         weight_short = {
-            "ema_gap": -2.0,
-            "ema_trend": -1.2,
-            "ema_cross": -1.5,
-            "rsi": 0.04,
-            "macd_hist": -1.8,
-            "momentum": -1.2,
-            "volatility": -0.8,
+            "ema_gap": -3.2,
+            "ema_trend": -1.8,
+            "ema_cross": -2.2,
+            "rsi": 0.05,
+            "macd_hist": -2.4,
+            "momentum": -1.6,
+            "volatility": -1.0,
         }
 
-        bias = -0.1
+        bias = 0.05
 
         def sigmoid(x: float) -> float:
             return 1 / (1 + math.exp(-x))
@@ -507,13 +514,13 @@ class SignalEngine:
         long_score = bias
         short_score = bias
         normalisers = {
-            "ema_gap": 1.0,
-            "ema_trend": 1.0,
+            "ema_gap": 0.75,
+            "ema_trend": 0.75,
             "ema_cross": 1.0,
             "rsi": 50.0,
-            "macd_hist": 0.0005,
-            "momentum": 0.5,
-            "volatility": 0.02,
+            "macd_hist": 0.00035,
+            "momentum": 0.35,
+            "volatility": 0.015,
         }
 
         for key, value in features.items():
