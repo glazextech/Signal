@@ -1,308 +1,376 @@
-"""XAUUSD scalping analiz aracı (MetaTrader5).
+"""MetaTrader 5 XAUUSD scalping helper.
 
-Bu modül MetaTrader 5 terminaline bağlanır, XAUUSD için son fiyat verilerini
-indirir, hızlı teknik indikatörleri hesaplar ve manuel işlemleriniz için
-öneri niteliğinde sinyal çıktısı sağlar. Herhangi bir otomatik emir gönderimi
-yapmaz; işlemlerinizi terminal içinde manuel olarak açmanız beklenir.
+Bu modül, MetaTrader 5 terminalinden veri çekerek XAUUSD (Altın) için
+yüksek frekanslı (scalping) işlem sinyali üretir. Strateji, çoklu zaman
+ölçeğinde trend filtreleme, momentuma dayalı giriş ve volatilite tabanlı
+çıkış seviyeleri içerir.
 
-Öne çıkanlar:
-    * `--terminal-path` ile yerel MT5 terminalini otomatik başlatabilir.
-    * Halihazırda giriş yapılmış MT5 oturumuyla (şifre girmeden) çalışır.
-    * İsteğe bağlı `--account/--password/--server` argümanlarıyla API üzerinden
-      yeniden giriş yapabilirsiniz.
-
-Gereksinimler:
+Kurulum:
     pip install MetaTrader5 pandas numpy
 
-Önemli:
-    - MT5 terminali yüklü, algoritmik işleme izin verilmiş ve (şifresiz modda
-      kullanacaksanız) broker hesabındaki oturumunuz açık olmalıdır.
-    - Python mimarisi (32/64 bit) MT5 terminaliyle eşleşmelidir.
-    - Kaldıraçlı ürünler yüksek risk taşır; önce demo hesapta test edin.
+MetaTrader 5 terminalinin kurulu ve açık olduğundan emin olun. Gerekirse
+giriş bilgilerini (account, password, server) initialize_mt5 fonksiyonuna
+geçebilirsiniz.
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import MetaTrader5 as mt5  # type: ignore
+import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
 class StrategyConfig:
-    symbol: str = "XAUUSD"
-    timeframe: int = mt5.TIMEFRAME_M1
-    lookback: int = 600  # fetch ~10 hours of 1-minute candles
-    max_spread_points: float = 30.0
-    risk_per_trade: float = 0.005  # 0.5% of equity
-    atr_period: int = 14
-    ema_fast_period: int = 9
-    ema_slow_period: int = 21
+    """Stratejiye ait ayarlar."""
+
+    symbol: str = "GOLD#"
+    trend_timeframe: int = mt5.TIMEFRAME_M5
+    entry_timeframe: int = mt5.TIMEFRAME_M1
+    ema_fast_period: int = 21
+    ema_slow_period: int = 55
+    entry_ema_fast_period: int = 13
+    entry_ema_slow_period: int = 34
     rsi_period: int = 14
-    rsi_upper: float = 65.0
-    rsi_lower: float = 35.0
-    reward_risk_ratio: float = 1.5
-    account: Optional[int] = None
-    password: Optional[str] = None
-    server: Optional[str] = None
-    terminal_path: Optional[str] = None
-    lot: float = 0.10  # fallback lot kullanıcının manuel değerlendirmesi için
+    entry_rsi_period: int = 9
+    atr_period: int = 14
+    entry_atr_period: int = 10
+    atr_multiplier_stop: float = 0.8
+    atr_multiplier_take_profit: float = 1.9
+    min_tick_volume: int = 60
+    volume_window: int = 120
+    min_volume_quantile: float = 0.55
+    trend_lookback: int = 800
+    entry_lookback: int = 500
+    min_trend_strength: float = 0.35
+    trend_rsi_bullish: float = 55.0
+    trend_rsi_bearish: float = 45.0
+    rsi_buy_threshold: float = 57.0
+    rsi_sell_threshold: float = 43.0
+    min_momentum_ratio: float = 0.25
+    max_vwap_distance_atr: float = 1.25
+    min_atr_ratio: float = 0.0006
+    max_atr_ratio: float = 0.0045
+    breakout_lookback: int = 15
+    cooldown_seconds: int = 120
+    max_open_positions: int = 3
+    lot_buy: float = 0.25
+    lot_sell: float = 0.08
+    deviation_points: int = 20
 
 
-# ---------------------------------------------------------------------------
-# MT5 helpers
-# ---------------------------------------------------------------------------
+@dataclass
+class Signal:
+    """Stratejinin ürettiği işlem sinyali."""
+
+    symbol: str
+    direction: str  # "BUY", "SELL" veya "FLAT"
+    timestamp: datetime
+    price: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    confidence: float = 0.0
+    comment: str = ""
 
 
-def initialize_mt5(config: StrategyConfig) -> None:
-    """Initialise MT5 terminal, optionally auto-launching and logging in."""
+def initialize_mt5(account: Optional[int] = None,
+                   password: Optional[str] = None,
+                   server: Optional[str] = None) -> None:
+    """MetaTrader 5 bağlantısını başlat."""
 
-    init_kwargs = {"path": config.terminal_path} if config.terminal_path else {}
-    if not mt5.initialize(**init_kwargs):
-        error = mt5.last_error()
-        if error and error[0] == -6:
-            raise RuntimeError(
-                "MT5 initialize() yetkilendirme hatası (-6). Terminali manuel olarak açıp broker hesabınıza giriş yapın "
-                "ve tekrar deneyin. Eğer terminali otomatik başlatmak istiyorsanız --terminal-path ile terminal64.exe yolunu "
-                "verip hesabın giriş bilgilerinin terminalde kayıtlı olduğundan emin olun."
-            )
-        raise RuntimeError(f"MT5 initialize() failed, error code: {error}")
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
 
-    if config.account and config.password and config.server:
-        authorized = mt5.login(config.account, password=config.password, server=config.server)
+    if account is not None:
+        authorized = mt5.login(login=account, password=password, server=server)
         if not authorized:
-            last_error = mt5.last_error()
-            mt5.shutdown()
-            raise RuntimeError(
-                f"MT5 login failed (account={config.account}), error: {last_error}"
-            )
-        logging.info("Logged in to MT5 account %s via API", config.account)
-    else:
-        logging.info("Using existing MT5 terminal session (no credentials supplied)")
+            raise RuntimeError(f"Login failed: {mt5.last_error()}")
 
 
 def shutdown_mt5() -> None:
-    """Gracefully close MT5 API connection."""
+    """MetaTrader 5 bağlantısını kapat."""
 
     mt5.shutdown()
 
 
-def fetch_rates(config: StrategyConfig) -> pd.DataFrame:
-    """Fetch recent price candles for the configured symbol/timeframe."""
-
-    rates = mt5.copy_rates_from_pos(
-        config.symbol,
-        config.timeframe,
-        0,
-        config.lookback,
-    )
-
+def _rates_to_dataframe(rates: np.ndarray) -> pd.DataFrame:
     if rates is None or len(rates) == 0:
-        raise RuntimeError(f"Failed to fetch rates for {config.symbol}: {mt5.last_error()}")
+        raise RuntimeError("MT5, talep edilen veri kümesini döndüremedi.")
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df.set_index("time", inplace=True)
-    return df
+    return df[["open", "high", "low", "close", "tick_volume"]]
 
 
-# ---------------------------------------------------------------------------
-# Indicator engine
-# ---------------------------------------------------------------------------
+def fetch_rates(symbol: str, timeframe: int, count: int) -> pd.DataFrame:
+    """MetaTrader 5'ten veri al ve DataFrame'e dönüştür."""
+
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    return _rates_to_dataframe(rates)
 
 
-def compute_indicators(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
-    """Append EMA, RSI, ATR indicators to the price DataFrame."""
+def compute_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
-    prices = df.copy()
 
-    prices["ema_fast"] = prices["close"].ewm(span=config.ema_fast_period, adjust=False).mean()
-    prices["ema_slow"] = prices["close"].ewm(span=config.ema_slow_period, adjust=False).mean()
+def compute_rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-    delta = prices["close"].diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / config.rsi_period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    prices["rsi"] = 100 - (100 / (1 + rs))
 
-    tr = np.maximum(
-        prices["high"] - prices["low"],
-        np.maximum(
-            prices["high"] - prices["close"].shift(1),
-            prices["close"].shift(1) - prices["low"],
-        ),
+def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr_components = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
+        axis=1,
     )
-    prices["atr"] = tr.rolling(window=config.atr_period, min_periods=1).mean()
-
-    return prices
-
-
-# ---------------------------------------------------------------------------
-# Signal generation
-# ---------------------------------------------------------------------------
+    true_range = tr_components.max(axis=1)
+    atr = true_range.ewm(alpha=1 / period, adjust=False).mean()
+    return atr
 
 
-@dataclass
-class TradeSignal:
-    direction: str
-    timestamp: datetime
-    entry: float
-    stop_loss: float
-    take_profit: float
-    comment: str
+def compute_vwap(df: pd.DataFrame) -> pd.Series:
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    cumulative_tp_vol = (typical_price * df["tick_volume"]).cumsum()
+    cumulative_vol = df["tick_volume"].cumsum().replace(0, np.nan)
+    return cumulative_tp_vol / cumulative_vol
 
 
-def generate_signal(prices: pd.DataFrame, config: StrategyConfig) -> Optional[TradeSignal]:
-    """Generate a trade signal based on EMA crossover + RSI filter + volatility."""
+class ScalpingStrategy:
+    """XAUUSD için çoklu zaman ölçekli scalping stratejisi."""
 
-    latest = prices.iloc[-1]
-    previous = prices.iloc[-2]
+    def __init__(self, config: StrategyConfig) -> None:
+        self.config = config
+        self._last_signal_time: Optional[datetime] = None
+        self._last_direction: Optional[str] = None
 
-    symbol_info = mt5.symbol_info(config.symbol)
-    if symbol_info is None:
-        logging.warning("Symbol info for %s unavailable; cannot compute signal", config.symbol)
-        return None
+    def _prepare_trend_dataframe(self) -> pd.DataFrame:
+        df = fetch_rates(self.config.symbol, self.config.trend_timeframe, self.config.trend_lookback)
+        df["ema_fast"] = compute_ema(df["close"], self.config.ema_fast_period)
+        df["ema_slow"] = compute_ema(df["close"], self.config.ema_slow_period)
+        df["rsi"] = compute_rsi(df["close"], self.config.rsi_period)
+        df["atr"] = compute_atr(df, self.config.atr_period)
+        df["vwap"] = compute_vwap(df)
+        return df.dropna()
 
-    spread_points = (latest["ask"] - latest["bid"]) / symbol_info.point
-    if spread_points > config.max_spread_points:
-        logging.info("Spread %.1f exceeds threshold %.1f, skipping signal.", spread_points, config.max_spread_points)
-        return None
+    def _prepare_entry_dataframe(self) -> pd.DataFrame:
+        df = fetch_rates(self.config.symbol, self.config.entry_timeframe, self.config.entry_lookback)
+        df["ema_fast"] = compute_ema(df["close"], self.config.entry_ema_fast_period)
+        df["ema_slow"] = compute_ema(df["close"], self.config.entry_ema_slow_period)
+        df["rsi"] = compute_rsi(df["close"], self.config.entry_rsi_period)
+        df["atr"] = compute_atr(df, self.config.entry_atr_period)
+        df["vwap"] = compute_vwap(df)
+        return df.dropna()
 
-    # EMA crossover logic
-    bullish_cross = previous["ema_fast"] <= previous["ema_slow"] and latest["ema_fast"] > latest["ema_slow"]
-    bearish_cross = previous["ema_fast"] >= previous["ema_slow"] and latest["ema_fast"] < latest["ema_slow"]
+    def _volume_threshold(self, entry_df: pd.DataFrame) -> float:
+        if entry_df.empty:
+            return float(self.config.min_tick_volume)
+        window = min(len(entry_df), self.config.volume_window)
+        recent = entry_df["tick_volume"].tail(window)
+        if len(recent) < 10:
+            return float(self.config.min_tick_volume)
+        quantile_value = float(np.quantile(recent, self.config.min_volume_quantile))
+        return max(self.config.min_tick_volume, quantile_value)
 
-    atr_points = latest["atr"]
+    def _cooldown_active(self, current_time: datetime) -> bool:
+        if self._last_signal_time is None:
+            return False
+        delta = current_time - self._last_signal_time
+        return delta < timedelta(seconds=self.config.cooldown_seconds)
 
-    if bullish_cross and latest["rsi"] < config.rsi_upper:
-        entry = latest["ask"]
-        stop_loss = entry - 1.5 * atr_points
-        take_profit = entry + config.reward_risk_ratio * (entry - stop_loss)
-        return TradeSignal(
-            direction="buy",
-            timestamp=latest.name.to_pydatetime(),
-            entry=entry,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            comment="EMA bull cross + RSI filter",
+    def generate_signal(self) -> Signal:
+        trend_df = self._prepare_trend_dataframe()
+        entry_df = self._prepare_entry_dataframe()
+
+        if trend_df.empty or entry_df.empty:
+            raise RuntimeError("Gerekli veri hazırlanamadı.")
+
+        trend_row = trend_df.iloc[-1]
+        entry_row = entry_df.iloc[-1]
+        timestamp = entry_row.name.to_pydatetime().astimezone(timezone.utc)
+
+        if self._cooldown_active(timestamp):
+            return Signal(self.config.symbol, "FLAT", timestamp, float(entry_row["close"]), comment="Cooldown aktif")
+
+        atr_value = float(entry_row["atr"])
+        if np.isnan(atr_value) or atr_value <= 0:
+            raise RuntimeError("ATR hesaplanamadı veya 0 çıktı.")
+
+        atr_ratio = atr_value / float(entry_row["close"])
+        if atr_ratio < self.config.min_atr_ratio or atr_ratio > self.config.max_atr_ratio:
+            return Signal(self.config.symbol, "FLAT", timestamp, float(entry_row["close"]), comment="ATR oranı uygun değil")
+
+        volume_threshold = self._volume_threshold(entry_df)
+        if entry_row["tick_volume"] < volume_threshold:
+            return Signal(self.config.symbol, "FLAT", timestamp, float(entry_row["close"]), comment="Hacim yetersiz")
+
+        trend_bias = "BULLISH" if trend_row["ema_fast"] > trend_row["ema_slow"] else "BEARISH"
+        trend_strength = (trend_row["ema_fast"] - trend_row["ema_slow"]) / max(trend_row["atr"], 1e-6)
+
+        if abs(trend_strength) < self.config.min_trend_strength:
+            return Signal(self.config.symbol, "FLAT", timestamp, float(entry_row["close"]), comment="Trend gücü zayıf")
+
+        if trend_bias == "BULLISH" and trend_row["rsi"] < self.config.trend_rsi_bullish:
+            return Signal(self.config.symbol, "FLAT", timestamp, float(entry_row["close"]), comment="Trend RSI teyidi yok")
+        if trend_bias == "BEARISH" and trend_row["rsi"] > self.config.trend_rsi_bearish:
+            return Signal(self.config.symbol, "FLAT", timestamp, float(entry_row["close"]), comment="Trend RSI teyidi yok")
+
+        price = float(entry_row["close"])
+        vwap = float(entry_row["vwap"])
+        vwap_bias = (price - vwap) / atr_value
+        if abs(vwap_bias) > self.config.max_vwap_distance_atr:
+            return Signal(self.config.symbol, "FLAT", timestamp, price, comment="VWAP uzaklığı aşırı")
+
+        intrabar_momentum = (entry_row["close"] - entry_row["open"]) / atr_value
+
+        recent_slice = entry_df.iloc[-(self.config.breakout_lookback + 1):-1]
+        recent_high = float(recent_slice["high"].max()) if not recent_slice.empty else price
+        recent_low = float(recent_slice["low"].min()) if not recent_slice.empty else price
+
+        confidence = min(1.0, max(0.0, abs(trend_strength)))
+        comment = ""
+
+        direction = "FLAT"
+        stop_loss: Optional[float] = None
+        take_profit: Optional[float] = None
+
+        if (
+            trend_bias == "BULLISH"
+            and entry_row["ema_fast"] > entry_row["ema_slow"]
+            and entry_row["rsi"] >= self.config.rsi_buy_threshold
+            and intrabar_momentum >= self.config.min_momentum_ratio
+            and price >= recent_high - 0.25 * atr_value
+            and vwap_bias > -0.1
+        ):
+            direction = "BUY"
+            stop_loss = price - self.config.atr_multiplier_stop * atr_value
+            take_profit = price + self.config.atr_multiplier_take_profit * atr_value
+            comment = "Trend + momentum uyumu"
+
+        elif (
+            trend_bias == "BEARISH"
+            and entry_row["ema_fast"] < entry_row["ema_slow"]
+            and entry_row["rsi"] <= self.config.rsi_sell_threshold
+            and -intrabar_momentum >= self.config.min_momentum_ratio
+            and price <= recent_low + 0.25 * atr_value
+            and vwap_bias < 0.1
+        ):
+            direction = "SELL"
+            stop_loss = price + self.config.atr_multiplier_stop * atr_value
+            take_profit = price - self.config.atr_multiplier_take_profit * atr_value
+            comment = "Trend + momentum uyumu"
+
+        signal = Signal(
+            symbol=self.config.symbol,
+            direction=direction,
+            timestamp=timestamp,
+            price=price,
+            stop_loss=float(stop_loss) if stop_loss is not None else None,
+            take_profit=float(take_profit) if take_profit is not None else None,
+            confidence=confidence,
+            comment=comment,
         )
 
-    if bearish_cross and latest["rsi"] > config.rsi_lower:
-        entry = latest["bid"]
-        stop_loss = entry + 1.5 * atr_points
-        take_profit = entry - config.reward_risk_ratio * (stop_loss - entry)
-        return TradeSignal(
-            direction="sell",
-            timestamp=latest.name.to_pydatetime(),
-            entry=entry,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            comment="EMA bear cross + RSI filter",
-        )
+        if signal.direction != "FLAT":
+            self._last_signal_time = timestamp
+            self._last_direction = signal.direction
 
-    return None
+        return signal
 
 
-def format_signal(signal: TradeSignal, config: StrategyConfig) -> str:
-    """İnsan tarafından okunabilir sinyal çıktısı üret."""
-
-    direction = "AL" if signal.direction == "buy" else "SAT"
-    lines = [
-        f"Sinyal: {direction}",
-        f"Zaman: {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"Giriş fiyatı: {signal.entry:.2f}",
-        f"Stop-loss:   {signal.stop_loss:.2f}",
-        f"Take-profit: {signal.take_profit:.2f}",
-        f"Not: {signal.comment}",
-    ]
-    if config.lot:
-        lines.append(f"Önerilen lot referansı (manuel değerlendirme): {config.lot:.2f}")
-    return "\n".join(lines)
+def _respect_position_limit(symbol: str, max_open_positions: int) -> bool:
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        return True
+    return len(positions) < max_open_positions
 
 
-# ---------------------------------------------------------------------------
-# CLI utilities
-# ---------------------------------------------------------------------------
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MetaTrader5 XAUUSD scalping signal generator")
-    parser.add_argument("--account", type=int, help="Override account login (optional)")
-    parser.add_argument("--password", type=str, help="Override account password (optional)")
-    parser.add_argument("--server", type=str, help="Override trade server name (optional)")
-    parser.add_argument(
-        "--terminal-path",
-        type=str,
-        help="Absolute path to terminal64.exe (auto-launch MT5 if given)",
-    )
-    parser.add_argument("--lots", type=float, default=0.10, help="Manuel işlemde referans alacağınız lot değeri")
-    parser.add_argument(
-        "--max-spread",
-        type=float,
-        default=30.0,
-        help="Maximum spread in points to accept a trade (default: 30)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug logs",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    config = StrategyConfig(
-        account=args.account,
-        password=args.password,
-        server=args.server,
-        terminal_path=args.terminal_path,
-        lot=args.lots,
-        max_spread_points=args.max_spread,
-    )
+def example_usage(iteration: int, strategy: ScalpingStrategy) -> None:
+    _LOGGER.setLevel(logging.INFO)
 
     try:
-        initialize_mt5(config)
-        logging.info("MT5 terminal initialised")
+        signal = strategy.generate_signal()
+    except Exception as exc:  # broad catch for demo amaçlı
+        print(f"[{iteration}] Hata: {exc}")
+        return
 
-        raw = fetch_rates(config)
-        symbol_info = mt5.symbol_info_tick(config.symbol)
-        if symbol_info is None:
-            raise RuntimeError(f"Symbol tick info for {config.symbol} unavailable")
+    if signal.direction == "FLAT":
+        print(f"[{iteration}] Sinyal yok → {signal.comment}")
+        return
 
-        raw["bid"] = symbol_info.bid
-        raw["ask"] = symbol_info.ask
+    print(
+        f"[{iteration}] {signal.direction} sinyali! Fiyat: {signal.price:.2f} | SL: {signal.stop_loss:.2f} | TP: {signal.take_profit:.2f}"
+    )
 
-        enriched = compute_indicators(raw, config)
-        signal = generate_signal(enriched, config)
+    if not _respect_position_limit(signal.symbol, strategy.config.max_open_positions):
+        print("Açık pozisyon limiti dolu → Yeni işlem açılmıyor.")
+        return
 
-        if signal:
-            logging.info("Sinyal bulundu:\n%s", format_signal(signal, config))
-        else:
-            logging.info("No valid signal at %s", datetime.now(timezone.utc))
+    tick = mt5.symbol_info_tick(signal.symbol)
+    if not tick:
+        print("Tick alınamadı.")
+        return
 
-    finally:
-        shutdown_mt5()
+    lot = strategy.config.lot_buy if signal.direction == "BUY" else strategy.config.lot_sell
+    price = tick.ask if signal.direction == "BUY" else tick.bid
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": signal.symbol,
+        "volume": lot,
+        "type": mt5.ORDER_TYPE_BUY if signal.direction == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "sl": signal.stop_loss,
+        "tp": signal.take_profit,
+        "deviation": strategy.config.deviation_points,
+        "magic": 12345,
+        "comment": f"auto {signal.direction.lower()} ({signal.confidence:.2f})",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    print(f"{signal.direction} result:", result)
+
+    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        ticket = result.order
+        print(f"{signal.direction} açıldı! Ticket: {ticket}")
+    else:
+        print("Emir gönderilemedi veya reddedildi.")
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+    sayac = 0
+    strategy = ScalpingStrategy(StrategyConfig())
+
+    try:
+        initialize_mt5()
+        print("------------------")
+        while True:
+            sayac += 1
+            example_usage(sayac, strategy)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Döngü kullanıcı tarafından durduruldu.")
+    except Exception as exc:
+        print("Hata:", exc)
+    finally:
+        shutdown_mt5()
 
