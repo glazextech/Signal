@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Tuple
@@ -55,7 +56,7 @@ class StrategyConfig:
     atr_pct_min: float = 0.0006
     atr_pct_max: float = 0.0035
     vwap_distance_max_atr: float = 1.2
-    min_confidence: float = 0.65
+    min_confidence: float = 0.7
     cooldown_bars: int = 3
     max_spread_points: float = 45.0
     candle_body_ratio_min: float = 0.28
@@ -63,6 +64,16 @@ class StrategyConfig:
     swing_window: int = 30
     swing_bias_buy: float = 0.55
     swing_bias_sell: float = 0.45
+    min_close_momentum_pips: float = 2.0
+    noise_ratio_window: int = 8
+    noise_ratio_threshold: float = 1.7
+    max_total_wick_ratio: float = 2.4
+    atr_regime_min_ratio: float = 0.55
+    max_atr_spike_ratio: float = 2.1
+    volatility_regime_window: int = 90
+    enable_session_filter: bool = True
+    session_utc_ranges: Tuple[Tuple[int, int], ...] = ((6, 12), (13, 20))
+    max_same_direction_signals: int = 2
 
 
 @dataclass
@@ -155,6 +166,7 @@ class ScalpingStrategy:
     def __init__(self, config: StrategyConfig) -> None:
         self.config = config
         self._last_signal_time: Optional[datetime] = None
+        self._recent_directions: deque[str] = deque(maxlen=10)
 
     def _prepare_trend_dataframe(self) -> pd.DataFrame:
         df = fetch_rates(self.config.symbol, self.config.trend_timeframe, self.config.trend_lookback)
@@ -194,11 +206,23 @@ class ScalpingStrategy:
         df["lower_wick"] = (lower_anchor - df["low"]).clip(lower=0)
         df["upper_wick_ratio"] = df["upper_wick"] / df["candle_range"]
         df["lower_wick_ratio"] = df["lower_wick"] / df["candle_range"]
+        df["total_wick_ratio"] = (df["upper_wick"] + df["lower_wick"]) / (df["candle_body"] + 1e-9)
+        df["noise_ratio"] = df["total_wick_ratio"].rolling(self.config.noise_ratio_window, min_periods=1).mean()
 
         df = df.dropna()
         if df.empty:
             raise RuntimeError("Giriş verisi hesaplanamadı.")
         return df
+
+    def _is_active_session(self, timestamp: datetime) -> bool:
+        if not self.config.enable_session_filter:
+            return True
+
+        hour_fraction = timestamp.hour + timestamp.minute / 60.0
+        for start, end in self.config.session_utc_ranges:
+            if start <= hour_fraction < end:
+                return True
+        return False
 
     def _evaluate_direction(
         self,
@@ -211,6 +235,7 @@ class ScalpingStrategy:
         pip_value: float,
         swing_high: float,
         swing_low: float,
+        atr_median: float,
     ) -> Tuple[Optional[dict], Tuple[str, ...]]:
         direction_sign = 1 if direction == "BUY" else -1
 
@@ -221,6 +246,9 @@ class ScalpingStrategy:
         price = tick.ask if direction == "BUY" else tick.bid
         if price is None or price <= 0:
             return None, (f"{direction}: Tick fiyatı geçersiz",)
+
+        if pip_value <= 0:
+            return None, (f"{direction}: Pip değeri geçersiz",)
 
         trend_gap = (trend_row["ema_fast"] - trend_row["ema_slow"]) * direction_sign
         entry_gap = (entry_row["ema_fast"] - entry_row["ema_slow"]) * direction_sign
@@ -234,6 +262,13 @@ class ScalpingStrategy:
             gating_reasons.append(
                 f"Giriş EMA uyumsuz: fark {entry_gap:+.3f}"
             )
+
+        total_wick_ratio = float(entry_row.get("total_wick_ratio", np.nan))
+        if not np.isnan(total_wick_ratio) and total_wick_ratio > self.config.max_total_wick_ratio:
+            gating_reasons.append(
+                f"Fitil/gövde oranı yüksek: {total_wick_ratio:.2f} > {self.config.max_total_wick_ratio:.2f}"
+            )
+
         if gating_reasons:
             return None, tuple(gating_reasons)
 
@@ -294,6 +329,15 @@ class ScalpingStrategy:
             f"Önceki EMA farkı {prev_entry_gap:+.3f}",
         )
 
+        close_momentum = (entry_row["close"] - previous_row["close"]) * direction_sign
+        close_momentum_pips = close_momentum / pip_value
+        add_condition(
+            "Close momentum",
+            close_momentum_pips >= self.config.min_close_momentum_pips,
+            1.1,
+            f"Kapanış momentumu {close_momentum_pips:.1f} pip",
+        )
+
         rsi_value = float(entry_row["rsi"])
         rsi_delta = (entry_row["rsi_delta"] or 0.0) * direction_sign
         add_condition(
@@ -334,6 +378,14 @@ class ScalpingStrategy:
             f"ATR% {atr_pct:.4f}",
         )
 
+        atr_ratio = atr_value / atr_median if atr_median > 0 else 1.0
+        add_condition(
+            "ATR regime",
+            self.config.atr_regime_min_ratio <= atr_ratio <= self.config.max_atr_spike_ratio,
+            0.8,
+            f"ATR oranı {atr_ratio:.2f}",
+        )
+
         body_ratio = float(entry_row["candle_body_ratio"]) if pd.notna(entry_row["candle_body_ratio"]) else 0.0
         candle_direction = (entry_row["close"] - entry_row["open"]) * direction_sign
         add_condition(
@@ -351,6 +403,14 @@ class ScalpingStrategy:
             wick_ratio <= self.config.wick_ratio_max,
             0.6,
             f"Fitil oranı {wick_ratio:.2f}",
+        )
+
+        noise_ratio = float(entry_row.get("noise_ratio", np.nan))
+        add_condition(
+            "Noise filter",
+            np.isnan(noise_ratio) or noise_ratio <= self.config.noise_ratio_threshold,
+            0.7,
+            f"Gürültü oranı {noise_ratio:.2f}",
         )
 
         swing_span = swing_high - swing_low
@@ -416,9 +476,27 @@ class ScalpingStrategy:
         if trend_df.empty or entry_df.empty:
             raise RuntimeError("Gerekli veri hazırlanamadı.")
 
+        if len(entry_df) < 2:
+            raise RuntimeError("Giriş zaman dilimi için yeterli mum verisi yok.")
+
         trend_row = trend_df.iloc[-1]
         entry_row = entry_df.iloc[-1]
         previous_row = entry_df.iloc[-2]
+
+        entry_timestamp = entry_row.name.to_pydatetime().astimezone(timezone.utc)
+
+        if not self._is_active_session(entry_timestamp):
+            reasons = (
+                f"Seans filtresi: {entry_timestamp.strftime('%H:%M UTC')} işlem aralığı dışında",
+            )
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(entry_row["close"]),
+                confidence=0.0,
+                reasons=reasons,
+            )
 
         tick = mt5.symbol_info_tick(self.config.symbol)
         if not tick:
@@ -452,6 +530,39 @@ class ScalpingStrategy:
         swing_high = float(recent_slice["high"].max())
         swing_low = float(recent_slice["low"].min())
 
+        atr_window = entry_df["atr"].tail(max(self.config.volatility_regime_window, 20))
+        atr_median = float(atr_window.median()) if not atr_window.empty else float(entry_row["atr"])
+        if not np.isfinite(atr_median) or atr_median <= 0:
+            atr_median = float(entry_row["atr"])
+
+        atr_spike_limit = atr_median * self.config.max_atr_spike_ratio if atr_median > 0 else np.inf
+        if atr_median > 0 and float(entry_row["atr"]) > atr_spike_limit:
+            reasons = (
+                f"ATR sıçraması: {entry_row['atr']:.3f} > limit {atr_spike_limit:.3f}",
+            )
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(entry_row["close"]),
+                confidence=0.0,
+                reasons=reasons,
+            )
+
+        noise_ratio = float(entry_row.get("noise_ratio", np.nan))
+        if np.isfinite(noise_ratio) and noise_ratio > self.config.noise_ratio_threshold * 1.25:
+            reasons = (
+                f"Gürültü oranı {noise_ratio:.2f} limit {self.config.noise_ratio_threshold * 1.25:.2f}",
+            )
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(entry_row["close"]),
+                confidence=0.0,
+                reasons=reasons,
+            )
+
         volume_series = entry_df["tick_volume"].tail(max(self.config.volume_lookback, 10))
         dynamic_threshold = volume_series.quantile(self.config.volume_quantile)
         if np.isnan(dynamic_threshold):
@@ -472,20 +583,19 @@ class ScalpingStrategy:
                 pip_value,
                 swing_high,
                 swing_low,
+                atr_median,
             )
             if evaluation:
                 evaluations.append(evaluation)
             else:
                 fallback_reasons.extend(f"{direction}: {reason}" for reason in gating)
 
-        timestamp = entry_row.name.to_pydatetime().astimezone(timezone.utc)
-
         if not evaluations:
             reasons = tuple(fallback_reasons) or ("Uygun yönlü trend filtresi bulunamadı.",)
             return Signal(
                 symbol=self.config.symbol,
                 direction="FLAT",
-                timestamp=timestamp,
+                timestamp=entry_timestamp,
                 price=float(entry_row["close"]),
                 confidence=0.0,
                 reasons=reasons,
@@ -498,14 +608,14 @@ class ScalpingStrategy:
             return Signal(
                 symbol=self.config.symbol,
                 direction="FLAT",
-                timestamp=timestamp,
+                timestamp=entry_timestamp,
                 price=float(best["price"]),
                 confidence=float(best["confidence"]),
                 reasons=reasons,
             )
 
         if self._last_signal_time is not None:
-            elapsed_minutes = (timestamp - self._last_signal_time).total_seconds() / 60.0
+            elapsed_minutes = (entry_timestamp - self._last_signal_time).total_seconds() / 60.0
             if elapsed_minutes < self.config.cooldown_bars:
                 reasons = best["reasons"] + (
                     f"⏳ Cooldown aktif: {elapsed_minutes:.1f} dk < {self.config.cooldown_bars} dk",
@@ -513,18 +623,40 @@ class ScalpingStrategy:
                 return Signal(
                     symbol=self.config.symbol,
                     direction="FLAT",
-                    timestamp=timestamp,
+                    timestamp=entry_timestamp,
                     price=float(best["price"]),
                     confidence=float(best["confidence"]),
                     reasons=reasons,
                 )
 
-        self._last_signal_time = timestamp
+        same_dir_streak = 0
+        if self._recent_directions:
+            for previous_direction in reversed(self._recent_directions):
+                if previous_direction == best["direction"]:
+                    same_dir_streak += 1
+                else:
+                    break
+
+        if same_dir_streak >= self.config.max_same_direction_signals:
+            reasons = best["reasons"] + (
+                f"Aynı yönde ardışık {same_dir_streak} sinyal → filtrelendi.",
+            )
+            return Signal(
+                symbol=self.config.symbol,
+                direction="FLAT",
+                timestamp=entry_timestamp,
+                price=float(best["price"]),
+                confidence=float(best["confidence"]),
+                reasons=reasons,
+            )
+
+        self._last_signal_time = entry_timestamp
+        self._recent_directions.append(best["direction"])
 
         return Signal(
             symbol=self.config.symbol,
             direction=best["direction"],
-            timestamp=timestamp,
+            timestamp=entry_timestamp,
             price=float(best["price"]),
             stop_loss=float(best["stop_loss"]),
             take_profit=float(best["take_profit"]),
